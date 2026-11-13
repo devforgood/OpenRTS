@@ -42,6 +42,14 @@ namespace OpenRTS.Shared.Serialization
             return v;
         }
 
+        public short ReadShort()
+        {
+            Require(2);
+            var v = BinaryPrimitives.ReadInt16LittleEndian(_buffer.AsSpan(_position));
+            _position += 2;
+            return v;
+        }
+
         public int ReadInt()
         {
             Require(4);

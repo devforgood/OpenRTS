@@ -1,18 +1,51 @@
-﻿using OpenRTS.Server;
+﻿using System.Globalization;
+using OpenRTS.Server;
 using OpenRTS.Server.Net;
 using OpenRTS.Server.Simulation;
 using OpenRTS.Shared;
+using OpenRTS.Shared.Protocol;
 
-// 사용법: OpenRTS.Server [--port 7777] [--bots 3]
+const string Usage = """
+    사용법: OpenRTS.Server [옵션]
+      --port <n>              UDP 포트 (기본 7777)
+      --bots <n>              봇 수 (기본 3, 최대 600)
+      --scenario <name>       wander | converge | circleswap | crossing (기본 wander)
+      --radius <r>            유닛 반지름 (기본 0.5)
+      --speed <v>             유닛 속도 (기본 6)
+      --no-avoidance          충돌 회피 끄기
+      --no-debug-commands     클라이언트의 설정 변경 요청 거부
+    """;
+
 var port = SimConstants.DefaultPort;
-var bots = 3;
-for (var i = 0; i < args.Length - 1; i++)
+var settings = SimSettings.Default;
+var allowDebug = true;
+try
 {
-    switch (args[i])
+    for (var i = 0; i < args.Length; i++)
     {
-        case "--port": port = int.Parse(args[++i]); break;
-        case "--bots": bots = int.Parse(args[++i]); break;
+        string Next() => i + 1 < args.Length ? args[++i] : throw new ArgumentException($"{args[i]} needs a value");
+        float NextFloat() => float.Parse(Next(), CultureInfo.InvariantCulture);
+
+        switch (args[i])
+        {
+            case "--port": port = int.Parse(Next()); break;
+            case "--bots": settings.BotCount = ushort.Parse(Next()); break;
+            case "--scenario": settings.Scenario = Enum.Parse<BotScenario>(Next(), ignoreCase: true); break;
+            case "--radius": settings.UnitRadius = NextFloat(); break;
+            case "--speed": settings.UnitSpeed = NextFloat(); break;
+            case "--no-avoidance": settings.Avoidance = false; break;
+            case "--no-debug-commands": allowDebug = false; break;
+            case "-h" or "--help": Console.WriteLine(Usage); return;
+            default: throw new ArgumentException($"unknown option {args[i]}");
+        }
     }
+}
+catch (Exception e) when (e is ArgumentException or FormatException or OverflowException)
+{
+    Console.Error.WriteLine(e.Message);
+    Console.Error.WriteLine(Usage);
+    Environment.ExitCode = 2;
+    return;
 }
 
 using var cts = new CancellationTokenSource();
@@ -22,15 +55,14 @@ Console.CancelKeyPress += (_, e) =>
     cts.Cancel();
 };
 
-var world = new World(seed: Environment.TickCount);
-for (var i = 0; i < bots; i++)
-{
-    world.SpawnRandom(isBot: true);
-}
+var world = new World(seed: Environment.TickCount, settings);
+world.ResetScenario();
 
-using var server = new GameServer(world, msg => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {msg}"));
+using var server = new GameServer(world, msg => Console.WriteLine($"[{DateTime.Now:HH:mm:ss}] {msg}"), allowDebug);
 server.Start(port);
-Console.WriteLine($"OpenRTS server: tick {SimConstants.TickRate}Hz, snapshot {SimConstants.SnapshotRate}Hz, protocol v{SimConstants.ProtocolVersion}, bots {bots}. Ctrl+C to stop.");
+Console.WriteLine($"OpenRTS server: tick {SimConstants.TickRate}Hz, snapshot {SimConstants.SnapshotRate}Hz, protocol v{SimConstants.ProtocolVersion}");
+Console.WriteLine($"  {world.Settings}");
+Console.WriteLine($"  debug commands {(allowDebug ? "allowed" : "disabled")}. Ctrl+C to stop.");
 
 var loop = new GameLoop(SimConstants.TickRate);
 await loop.RunAsync(tick => server.Tick((uint)tick), cts.Token);

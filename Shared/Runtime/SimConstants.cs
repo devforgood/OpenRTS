@@ -22,9 +22,9 @@ namespace OpenRTS.Shared
         public const string ConnectionKey = "OpenRTS";
 
         /// <summary>프로토콜 버전. 서버와 클라이언트가 다르면 접속을 거부한다.</summary>
-        public const int ProtocolVersion = 2;
+        public const int ProtocolVersion = 3;
 
-        /// <summary>유닛 기본 이동 속도(유닛/초).</summary>
+        /// <summary>유닛 기본 이동 속도(유닛/초). 실행 중 값은 SimSettings.UnitSpeed.</summary>
         public const float UnitSpeed = 6f;
 
         /// <summary>맵 반폭. 맵은 (-MapHalfSize, -MapHalfSize) ~ (MapHalfSize, MapHalfSize).</summary>

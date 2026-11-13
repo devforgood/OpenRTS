@@ -31,6 +31,9 @@ namespace OpenRTS.Client.Debugging
         private int _maxOtherUnits;
         private bool _done;
 
+        /// <summary>서버 설정의 유닛 속도.</summary>
+        private float Speed => Client.Settings?.UnitSpeed ?? SimConstants.UnitSpeed;
+
         public static bool IsRequested() => Array.IndexOf(Environment.GetCommandLineArgs(), "-autotest") >= 0;
 
         private void LateUpdate()
@@ -86,14 +89,14 @@ namespace OpenRTS.Client.Debugging
                 _extrapolatedFrames++;
             }
 
-            var travelTime = MoveDistance / SimConstants.UnitSpeed;
+            var travelTime = MoveDistance / Speed;
             if (_elapsed - _moveStartTime < travelTime + 1.5f)
             {
                 return;
             }
 
             var error = Vector2.Distance(pos, _target);
-            var speedRatio = _maxSpeed / SimConstants.UnitSpeed;
+            var speedRatio = _maxSpeed / Speed;
             var ok = error < 0.01f && speedRatio < 1.5f;
             Finish(ok,
                 $"final error {error:0.0000}, max on-screen speed {_maxSpeed:0.00} ({speedRatio:0.00}x unit speed), " +

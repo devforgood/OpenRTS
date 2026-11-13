@@ -44,7 +44,7 @@ namespace OpenRTS.Client.Debugging
                     $"tick {interp.LatestTick}  buffered {interp.BufferedCount}  delay {interp.InterpolationDelay * 1000:0} ms (target {interp.TargetInterpolationDelay * 1000:0})\n" +
                     $"snapshots {Client.SnapshotsReceived}  out-of-order {interp.DroppedOutOfOrder}  sim-dropped {Client.SnapshotsDroppedBySimulation}\n" +
                     $"{(interp.IsExtrapolating ? "<color=orange>EXTRAPOLATING</color>" : "interpolating")}  units {Views?.InterpolatedPositions.Count}\n") +
-                "RMB move · WASD pan · wheel zoom · [ ] latency · - = loss · F1 raw";
+                "RMB move · WASD pan · wheel zoom · [ ] latency · - = loss · F1 raw · F2 settings";
             GUI.Box(new Rect(10, 10, 470, 130), text, _style);
         }
     }

@@ -42,6 +42,7 @@ namespace OpenRTS.Client.Net
 
         private readonly PacketWriter _writer = new PacketWriter();
         private readonly List<UnitState> _snapshotUnits = new List<UnitState>();
+        private readonly SnapshotAssembler _assembler = new SnapshotAssembler();
         private readonly Queue<DelayedPacket> _inbound = new Queue<DelayedPacket>();
         private readonly Queue<DelayedPacket> _outbound = new Queue<DelayedPacket>();
         private readonly System.Random _random = new System.Random();
@@ -61,7 +62,17 @@ namespace OpenRTS.Client.Net
         public int SnapshotsReceived { get; private set; }
         public int SnapshotsDroppedBySimulation { get; private set; }
 
+        /// <summary>조각이 다 모이지 않아 버린 스냅샷 수.</summary>
+        public int SnapshotsIncomplete => _assembler.IncompleteDropped;
+
+        /// <summary>서버의 현재 시뮬레이션 설정 (입장 전에는 null).</summary>
+        public SimSettings? Settings { get; private set; }
+
+        /// <summary>서버가 보낸 최신 충돌 지표.</summary>
+        public SimStats? Stats { get; private set; }
+
         public event Action Joined;
+        public event Action<SimSettings> SettingsChanged;
 
         private void Start()
         {
@@ -119,6 +130,31 @@ namespace OpenRTS.Client.Net
             Send(_writer.ToArray(), DeliveryMethod.ReliableOrdered);
         }
 
+        /// <summary>서버에 설정 변경을 요청한다. 적용된 값은 SimSettings 메시지로 돌아온다.</summary>
+        public void SendSettings(SimSettings settings)
+        {
+            if (State != ClientState.Joined)
+            {
+                return;
+            }
+
+            _writer.Reset();
+            settings.Write(_writer, MessageType.SetSimSettings);
+            Send(_writer.ToArray(), DeliveryMethod.ReliableOrdered);
+        }
+
+        public void SendResetScenario()
+        {
+            if (State != ClientState.Joined)
+            {
+                return;
+            }
+
+            _writer.Reset();
+            _writer.WriteByte((byte)MessageType.ResetScenario);
+            Send(_writer.ToArray(), DeliveryMethod.ReliableOrdered);
+        }
+
         private void OnConnected(NetPeer peer)
         {
             _peer = peer;
@@ -171,18 +207,34 @@ namespace OpenRTS.Client.Net
                         break;
 
                     case MessageType.Snapshot:
-                        var tick = SnapshotMessage.Read(ref r, _snapshotUnits);
+                        var partTick = SnapshotMessage.ReadPart(ref r, _snapshotUnits, out var part, out var partCount);
+                        if (!_assembler.Add(partTick, part, partCount, _snapshotUnits, out var tick, out var units))
+                        {
+                            break;
+                        }
+
                         SnapshotsReceived++;
                         if (tick > Interpolator.LatestTick || Interpolator.BufferedCount == 0)
                         {
                             LatestRaw.Clear();
-                            foreach (var u in _snapshotUnits)
+                            foreach (var u in units)
                             {
                                 LatestRaw[u.Id] = u.Position;
                             }
                         }
 
-                        Interpolator.AddSnapshot(tick, _snapshotUnits);
+                        Interpolator.AddSnapshot(tick, units);
+                        break;
+
+                    case MessageType.SimSettings:
+                        var settings = SimSettings.Read(ref r);
+                        Settings = settings;
+                        Debug.Log($"[OpenRTS] settings: {settings}");
+                        SettingsChanged?.Invoke(settings);
+                        break;
+
+                    case MessageType.SimStats:
+                        Stats = SimStats.Read(ref r);
                         break;
                 }
             }

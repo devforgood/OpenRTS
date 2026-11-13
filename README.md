@@ -59,26 +59,65 @@ dotnet run --project src/OpenRTS.Server -- --port 7777 --bots 3   # Ctrl+C 로 �
 | `[` / `]` | 인위 지연(왕복) -/+ 50ms |
 | `-` / `=` | 스냅샷 손실 -/+ 5% |
 | F1 | 보간 전 최신 스냅샷 위치(노란 구) 표시 |
+| F2 | 시뮬레이션 설정 패널 (아래) |
 
 플레이어 명령줄 옵션: `-host 127.0.0.1 -port 7777 -latency 200 -loss 10 -autotest`
 
-자동 확인: `-autotest` 로 실행하면 접속 → 내 유닛을 8유닛 이동 → 화면 위치가 목표에 정확히 도착하는지, 이동 중 화면 속도가 실제 속도의 1.5배를 넘지 않는지(튐 없음) 확인합니다. 로그에 `AUTOTEST PASS/FAIL` 을 남기고 종료 코드 0/1 로 끝납니다.
+자동 확인: `-autotest` 로 실행하면 접속 → 내 유닛을 8유닛 이동 → 화면 위치가 목표에 정확히 도착하는지, 이동 중 화면 속도가 실제 속도의 1.5배를 넘지 않는지(튐 없음) 확인합니다. 로그에 `AUTOTEST PASS/FAIL` 을 남기고 종료 코드 0/1 로 끝납니다. 봇이 내 유닛을 밀 수 있으므로 서버는 `--bots 0` 으로 띄웁니다.
 
 ```bash
 Client/Builds/Windows/OpenRTS.exe -batchmode -nographics -autotest -latency 150 -loss 10 -logFile autotest.log
 ```
 
+### 충돌 처리 확인
+
+서버는 **RVO2(ORCA)** 로 유닛끼리 피하고, 그래도 남은 겹침은 **분리 보정**으로 밀어냅니다. 설정은 서버가 권위를 가지며, 클라이언트의 **F2 패널**에서 바꾸면 서버에 요청 → 서버가 범위를 검사해 적용 → 모든 클라이언트에 전파됩니다.
+
+| 설정 | 범위 | 기본 | 설명 |
+| --- | --- | --- | --- |
+| 봇 수 | 0~600 | 3 | 바꾸면 봇을 다시 배치 (플레이어 유닛은 유지) |
+| 시나리오 | Wander / Converge / Circle / Cross | Wander | 배회 / 원에서 중앙으로 집결 / 원 위에서 반대편으로 교차 / 두 무리 직각 교차. 도착 후 1초 쉬고 왕복 |
+| 반지름 | 0.1~2 | 0.5 | |
+| 속도 | 0.5~20 | 6 | |
+| RVO2 회피 | on/off | on | 끄면 직선으로 통과 |
+| neighbor dist / max neighbors / time horizon | 1~30 / 1~32 / 0.1~10 | 10 / 10 / 2 | ORCA 파라미터. 시간 지평이 길면 일찍 피하지만 소극적으로 움직임 |
+| separation | on/off | on | ORCA 후 남은 겹침을 틱마다 밀어서 풂 |
+| stop when blocked | on/off | on | 목표 근처(반지름 × 8)에서 1.5초, 먼 곳에서 6초 동안 진척이 없으면 멈춤 |
+
+패널 아래쪽에 서버가 2Hz로 보내는 지표가 나옵니다.
+
+- **min separation**: 가장 가까운 두 유닛의 거리 ÷ 반지름 합. 1 이상이면 겹침이 없습니다.
+- **overlapping pairs**: 5% 넘게 파고든 쌍의 수
+- **blocked stops**: 막혀서 멈춘 횟수
+- **server step**: 서버가 한 틱을 처리하는 데 걸린 시간
+
+서버 명령줄로 시작 값을 정할 수도 있습니다: `--bots 200 --scenario circleswap --radius 0.5 --speed 6 --no-avoidance --no-debug-commands`
+
+자동 확인: `-autotest-collision 100 circleswap` 로 실행하면 클라이언트가 설정 변경을 요청하고, 서버 적용과 전파, 화면 유닛 수, 12초 동안의 최소 간격(0.8 이상)을 확인합니다.
+
+조합별 수치(30초): `dotnet test --filter CollisionReport --logger "console;verbosity=detailed"`
+
+| 시나리오 | 회피 없음 최소 간격 | ORCA만 | ORCA + 분리 (기본) | 서버 1틱 |
+| --- | --- | --- | --- | --- |
+| 원형 교차 100 | 0.008 | 0.749 | **0.847** | 0.5ms |
+| 원형 교차 300 | 0.006 | 0.658 | 0.755 | 2.0ms |
+| 십자 교차 200 | 0.141 | 0.968 | **0.987** | 1.2ms |
+| 중앙 집결 60 | 0.000 | 1.000 | **1.000** | 0.2ms |
+| 배회 300 | 0.012 | 0.985 | **1.000** | 1.1ms |
+
+원형 교차는 모든 유닛이 같은 순간 중앙을 지나므로 ORCA가 모든 제약을 만족하는 속도를 찾지 못하는 순간이 생기고, 그때는 "덜 겹치는" 속도를 고릅니다. 십자 교차와 집결은 겹치지 않는 대신 정체가 심합니다(분석 문서 `collision-avoidance.md` 에서 예상한 ORCA의 약점). 막혔을 때 경로를 다시 찾는 기능은 로드맵 3단계에서 A\* 와 함께 넣습니다.
+
 ### 현재 구현 범위
 
 | 영역 | 구현 | 위치 |
 | --- | --- | --- |
-| 프로토콜 | ClientHello(버전 확인) / ServerWelcome / MoveCommand / Snapshot, 리틀 엔디언 바이너리 | `Shared/Runtime/Protocol`, `Serialization` |
-| 서버 | LiteNetLib UDP, 30Hz 틱, 15Hz 스냅샷(unreliable), 직선 이동, 봇 배회 | `Server/src/OpenRTS.Server` |
-| 클라이언트 보간 | 스냅샷 버퍼, 서버 시계 추정(점진 보정), 2스냅샷 지연 보간, 끊김 시 최대 0.25초 외삽, 늦게 온 스냅샷 폐기 | `Shared/Runtime/Interpolation` |
-| 클라이언트 | 접속, 우클릭 이동, 유닛 표시, 디버그 HUD, 지연·손실 시뮬레이션, 자동 확인 | `Client/Assets/Scripts` |
-| 테스트 | 직렬화, 이동, 보간기, 실제 UDP 접속 통합 테스트 (서버 프로젝트에서 Shared 까지 검증) | `Server/tests` |
+| 프로토콜 | 접속·입장, 이동 명령, 스냅샷(16비트 양자화, 패킷 크기에 맞춰 분할), 시뮬레이션 설정 조회·변경, 충돌 지표 | `Shared/Runtime/Protocol`, `Serialization` |
+| 서버 | LiteNetLib UDP, 30Hz 틱, 15Hz 스냅샷(unreliable), RVO2 회피 + 분리 보정, 공간 격자, 막힘 감지, 봇 시나리오 4종, 실행 중 설정 변경 | `Server/src/OpenRTS.Server` |
+| 클라이언트 보간 | 스냅샷 조각 조립, 스냅샷 버퍼, 서버 시계 추정(점진 보정), 적응형 렌더 지연, 끊김 시 최대 0.25초 외삽 | `Shared/Runtime/Interpolation` |
+| 클라이언트 | 접속, 우클릭 이동, 유닛 표시(반지름 반영), 디버그 HUD, F2 설정 패널, 지연·손실 시뮬레이션, 자동 확인 2종 | `Client/Assets/Scripts` |
+| 테스트 | 직렬화, 이동, 충돌 회피(시나리오별 최소 간격), 보간기, 실제 UDP 접속 통합 테스트(설정 전파, 450유닛 분할 스냅샷) | `Server/tests` |
 
-아직 없는 것: 경로 탐색, RVO2, 양자화·델타 압축, 시야 필터 (로드맵 2~5단계). 스냅샷은 유닛 100개까지만 담습니다(unreliable 패킷 한 개 크기 제한).
+아직 없는 것: 경로 탐색, 막힘 시 재경로, 델타 압축, 시야 필터 (로드맵 2~5단계). 스냅샷은 최대 600유닛(봇 한도)입니다.
 
 ---
 
@@ -92,7 +131,7 @@ Client/Builds/Windows/OpenRTS.exe -batchmode -nographics -autotest -latency 150 
 | QuadTree/QuadTree.cs | Microsoft Reference Source 원본 + LeagueSandbox 수정분(AGPL) | 수정분이 AGPL이라 그대로 쓸 수 없음 | 직접 구현 (공간 해시 또는 QuadTree) |
 | GameMaths/Geometry/Clipper.cs | Clipper 6.4.2, **Boost Software License 1.0** | 허용적 라이선스. 고지문 유지 시 사용 가능 | 필요해지면 복사하지 않고 공식 패키지 **Clipper2**(Boost) 를 NuGet으로 사용 |
 | LeaguePackets (서브모듈) | **Apache-2.0** | 라이선스상 사용 가능하나 LoL 전용 패킷 정의라 RTS에 쓸모 없음 | 사용 안 함 |
-| RVO2 Library (C# 포팅, UNC 배포본) — 참고 서버에는 없음. 충돌 회피용으로 별도 도입 | **Apache-2.0** (도입 시 원본 저장소에서 재확인) | 허용적 라이선스. LICENSE·NOTICE 고지 유지 시 사용 가능 | 3단계에서 도입. 수정한 파일에는 변경 사실을 표기 |
+| RVO2 Library (C# 포팅, UNC 배포본) — 참고 서버에는 없음. 충돌 회피용으로 별도 도입 | **Apache-2.0** (원본 저장소에서 확인, NOTICE 파일 없음) | 허용적 라이선스. 라이선스 전문·저작권 표기·변경 사실 명시 시 사용 가능 | **도입함.** ORCA·선형계획 부분만 `OrcaSolver.cs` 로 수정해 사용, 머리말에 변경 사항 기록 ([THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md)) |
 | Content/LeagueSandbox-Default (게임 데이터) | Riot Games 저작물 | 사용 불가 | 사용 안 함. 데이터는 전부 직접 제작 |
 | 분석 문서 (`pathfinding.md`, `collision-avoidance.md`, `ai.md`, `spells.md`), `tools/collision-lab.html` | 본 프로젝트 작성자가 직접 작성 | 자유롭게 참고 가능 | 설계 근거로 사용 |
 
@@ -223,7 +262,7 @@ Client/Builds/Windows/OpenRTS.exe -batchmode -nographics -autotest -latency 150 
 | **0. 골격** ✅ | 서버·클라이언트 프로젝트 생성, Shared 패키지 연결, 고정 틱 루프, 계획 수립 | `dotnet test` 통과, Unity에서 Shared 컴파일됨 |
 | **1. 이동 동기화** *(현재)* | LiteNetLib 접속·핸드셰이크, 우클릭 직선 이동, 위치 스냅샷 전송, 클라이언트 스냅샷 보간, 지연·손실 시뮬레이션 | 지연 150ms·손실 10% 에서도 두 클라이언트의 유닛이 튀지 않고 같은 위치에 도착 (`-autotest` 통과) |
 | **2. 이동** | 격자 맵, A* + 경로 단순화, 박스 선택·다중 유닛 명령, URP 설정 | 유닛 여러 개를 선택해 장애물을 돌아 이동 |
-| **3. 군집 이동** | 공간 분할, RVO2 도입, 막힘 감지 + 재경로, 스냅샷 양자화·델타 압축 | 50유닛이 좁은 길을 겹치거나 튀지 않고 통과, 대역폭 측정값 기록 |
+| **3. 군집 이동** *(일부 완료: 공간 분할, RVO2, 분리 보정, 막힘 감지, 양자화, 설정 패널)* | 막힘 시 재경로, 장애물과 RVO2 연동, 델타 압축 | 50유닛이 좁은 길을 겹치거나 튀지 않고 통과, 대역폭 측정값 기록 |
 | **4. 전투** | 체력·공격·투사체·사망, 변경분 스탯 복제, 자동 교전 AI | 두 팀 유닛이 교전해 한쪽이 전멸 |
 | **5. 시야** | 팀별 시야, 시야 기반 전송 필터, Fog of War 표시 | 상대 시야 밖 유닛 정보가 패킷에 없음을 테스트로 확인 |
 | **6. 경제·건설** | 자원 채집, 건물 건설, 유닛 생산 큐 | 일꾼 생산 → 채집 → 병력 생산 흐름 동작 |

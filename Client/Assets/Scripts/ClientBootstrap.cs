@@ -43,9 +43,19 @@ namespace OpenRTS.Client
             hud.Client = client;
             hud.Views = views;
 
+            var panel = root.AddComponent<SimSettingsPanel>();
+            panel.Client = client;
+
             if (MovementAutoTest.IsRequested())
             {
                 var test = root.AddComponent<MovementAutoTest>();
+                test.Client = client;
+                test.Views = views;
+            }
+
+            if (CollisionAutoTest.IsRequested())
+            {
+                var test = root.AddComponent<CollisionAutoTest>();
                 test.Client = client;
                 test.Views = views;
             }

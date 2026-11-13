@@ -1,5 +1,6 @@
 using System.Collections.Generic;
 using OpenRTS.Client.Net;
+using OpenRTS.Shared.Protocol;
 using UnityEngine;
 using Vector2 = System.Numerics.Vector2;
 
@@ -17,6 +18,10 @@ namespace OpenRTS.Client.View
         private readonly Dictionary<int, Transform> _ghosts = new Dictionary<int, Transform>();
         private readonly Dictionary<int, Vector2> _positions = new Dictionary<int, Vector2>();
         private readonly List<int> _removed = new List<int>();
+        private float _appliedRadius = -1f;
+
+        /// <summary>서버 설정의 유닛 반지름 (설정을 받기 전에는 기본값).</summary>
+        private float Radius => Client.Settings?.UnitRadius ?? SimSettings.Default.UnitRadius;
 
         public IReadOnlyDictionary<int, Vector2> InterpolatedPositions => _positions;
 
@@ -39,15 +44,27 @@ namespace OpenRTS.Client.View
 
             Client.Interpolator.Sample(_positions);
 
+            // 캡슐은 지름 1, 높이 2 → 반지름 r 이면 2r 배. 서버에서 반지름이 바뀌면 전부 다시 맞춘다.
+            var radius = Radius;
+            if (!Mathf.Approximately(radius, _appliedRadius))
+            {
+                _appliedRadius = radius;
+                foreach (var v in _views.Values)
+                {
+                    v.localScale = Vector3.one * (2 * radius);
+                }
+            }
+
             foreach (var kv in _positions)
             {
                 if (!_views.TryGetValue(kv.Key, out var view))
                 {
                     view = CreateUnit(kv.Key);
+                    view.localScale = Vector3.one * (2 * radius);
                     _views.Add(kv.Key, view);
                 }
 
-                var next = ToWorld(kv.Value, 1f);
+                var next = ToWorld(kv.Value, 2 * radius);
                 var delta = next - view.position;
                 delta.y = 0;
                 if (delta.sqrMagnitude > 1e-6f)
@@ -79,7 +96,7 @@ namespace OpenRTS.Client.View
                     _ghosts.Add(kv.Key, ghost);
                 }
 
-                ghost.position = ToWorld(kv.Value, 2.4f);
+                ghost.position = ToWorld(kv.Value, 4 * _appliedRadius + 0.4f);
             }
 
             RemoveMissing(_ghosts, Client.LatestRaw.ContainsKey);

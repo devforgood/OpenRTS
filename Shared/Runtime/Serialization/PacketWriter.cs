@@ -39,6 +39,13 @@ namespace OpenRTS.Shared.Serialization
             _length += 2;
         }
 
+        public void WriteShort(short value)
+        {
+            Ensure(2);
+            BinaryPrimitives.WriteInt16LittleEndian(_buffer.AsSpan(_length), value);
+            _length += 2;
+        }
+
         public void WriteInt(int value)
         {
             Ensure(4);
