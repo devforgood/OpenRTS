@@ -19,7 +19,8 @@ OpenRTS/
 ├─ Client/                         Unity 6 프로젝트 (6000.6.0f1)
 │  └─ Assets/Scripts/              클라이언트 코드 (OpenRTS.Client.asmdef → OpenRTS.Shared 참조)
 ├─ Directory.Build.props           모든 .NET 빌드 출력을 artifacts/ 로 모음
-└─ global.json                     .NET SDK 11.0.100 고정 (상위 기능 밴드 허용)
+├─ global.json                     .NET SDK 11.0.100 고정 (상위 기능 밴드 허용)
+└─ THIRD_PARTY_NOTICES.md          외부 라이브러리 라이선스 고지 (LiteNetLib MIT 등)
 ```
 
 ### 공용 코드(Shared) 관리 방식
@@ -40,12 +41,44 @@ DLL을 복사하지 않고 **같은 소스를 양쪽에서 컴파일**합니다.
 cd Server
 dotnet build
 dotnet test
-dotnet run --project src/OpenRTS.Server     # Ctrl+C 로 종료
+dotnet run --project src/OpenRTS.Server -- --port 7777 --bots 3   # Ctrl+C 로 종료
 ```
 
 클라이언트는 Unity Hub에서 `Client` 폴더를 열고 에디터 버전 **6000.6.0f1** 을 사용합니다.
 
-현재 상태: 서버는 30Hz 고정 틱 루프(`GameLoop`)와 테스트만 있습니다. 클라이언트는 Shared 연결 확인용 `ClientBootstrap` 스크립트만 있습니다.
+### 이동 동기화 확인 (현재 목표)
+
+1. 서버 실행: `dotnet run --project Server/src/OpenRTS.Server`. 서버가 배회하는 봇 유닛 3개를 만듭니다.
+2. Unity에서 `Assets/Scenes/Main.unity` 를 열고 Play 합니다. 어떤 씬이든 `ClientBootstrap` 이 카메라·바닥·네트워크 객체를 만듭니다.
+3. 두 번째 클라이언트가 필요하면 메뉴 **OpenRTS → Build Windows Player** 로 `Client/Builds/Windows/OpenRTS.exe` 를 만들어 함께 실행합니다.
+
+| 조작 | 기능 |
+| --- | --- |
+| 우클릭 | 내 유닛(초록) 이동 |
+| WASD / 화살표, 휠 | 카메라 이동, 줌 |
+| `[` / `]` | 인위 지연(왕복) -/+ 50ms |
+| `-` / `=` | 스냅샷 손실 -/+ 5% |
+| F1 | 보간 전 최신 스냅샷 위치(노란 구) 표시 |
+
+플레이어 명령줄 옵션: `-host 127.0.0.1 -port 7777 -latency 200 -loss 10 -autotest`
+
+자동 확인: `-autotest` 로 실행하면 접속 → 내 유닛을 8유닛 이동 → 화면 위치가 목표에 정확히 도착하는지, 이동 중 화면 속도가 실제 속도의 1.5배를 넘지 않는지(튐 없음) 확인합니다. 로그에 `AUTOTEST PASS/FAIL` 을 남기고 종료 코드 0/1 로 끝납니다.
+
+```bash
+Client/Builds/Windows/OpenRTS.exe -batchmode -nographics -autotest -latency 150 -loss 10 -logFile autotest.log
+```
+
+### 현재 구현 범위
+
+| 영역 | 구현 | 위치 |
+| --- | --- | --- |
+| 프로토콜 | ClientHello(버전 확인) / ServerWelcome / MoveCommand / Snapshot, 리틀 엔디언 바이너리 | `Shared/Runtime/Protocol`, `Serialization` |
+| 서버 | LiteNetLib UDP, 30Hz 틱, 15Hz 스냅샷(unreliable), 직선 이동, 봇 배회 | `Server/src/OpenRTS.Server` |
+| 클라이언트 보간 | 스냅샷 버퍼, 서버 시계 추정(점진 보정), 2스냅샷 지연 보간, 끊김 시 최대 0.25초 외삽, 늦게 온 스냅샷 폐기 | `Shared/Runtime/Interpolation` |
+| 클라이언트 | 접속, 우클릭 이동, 유닛 표시, 디버그 HUD, 지연·손실 시뮬레이션, 자동 확인 | `Client/Assets/Scripts` |
+| 테스트 | 직렬화, 이동, 보간기, 실제 UDP 접속 통합 테스트 (서버 프로젝트에서 Shared 까지 검증) | `Server/tests` |
+
+아직 없는 것: 경로 탐색, RVO2, 양자화·델타 압축, 시야 필터 (로드맵 2~5단계). 스냅샷은 유닛 100개까지만 담습니다(unreliable 패킷 한 개 크기 제한).
 
 ---
 
@@ -187,9 +220,9 @@ dotnet run --project src/OpenRTS.Server     # Ctrl+C 로 종료
 
 | 단계 | 목표 | 완료 기준 |
 | --- | --- | --- |
-| **0. 골격** *(현재)* | 서버·클라이언트 프로젝트 생성, Shared 패키지 연결, 고정 틱 루프, 계획 수립 | `dotnet test` 통과, Unity에서 Shared 컴파일됨 |
-| **1. 접속** | LiteNetLib 연결, 핸드셰이크(프로토콜 버전 확인), RTT 측정, URP 설정 | 클라이언트가 서버에 접속해 핑 표시 |
-| **2. 이동** | 격자 맵, A* + 경로 단순화, 박스 선택·우클릭 이동, 위치 스냅샷 전송, 클라이언트 스냅샷 보간 | 유닛 여러 개를 선택해 이동시키면 두 클라이언트에서 같은 위치로 보임 |
+| **0. 골격** ✅ | 서버·클라이언트 프로젝트 생성, Shared 패키지 연결, 고정 틱 루프, 계획 수립 | `dotnet test` 통과, Unity에서 Shared 컴파일됨 |
+| **1. 이동 동기화** *(현재)* | LiteNetLib 접속·핸드셰이크, 우클릭 직선 이동, 위치 스냅샷 전송, 클라이언트 스냅샷 보간, 지연·손실 시뮬레이션 | 지연 150ms·손실 10% 에서도 두 클라이언트의 유닛이 튀지 않고 같은 위치에 도착 (`-autotest` 통과) |
+| **2. 이동** | 격자 맵, A* + 경로 단순화, 박스 선택·다중 유닛 명령, URP 설정 | 유닛 여러 개를 선택해 장애물을 돌아 이동 |
 | **3. 군집 이동** | 공간 분할, RVO2 도입, 막힘 감지 + 재경로, 스냅샷 양자화·델타 압축 | 50유닛이 좁은 길을 겹치거나 튀지 않고 통과, 대역폭 측정값 기록 |
 | **4. 전투** | 체력·공격·투사체·사망, 변경분 스탯 복제, 자동 교전 AI | 두 팀 유닛이 교전해 한쪽이 전멸 |
 | **5. 시야** | 팀별 시야, 시야 기반 전송 필터, Fog of War 표시 | 상대 시야 밖 유닛 정보가 패킷에 없음을 테스트로 확인 |
