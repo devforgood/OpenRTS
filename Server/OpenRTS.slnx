@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/Shared/">
+    <Project Path="../Shared/OpenRTS.Shared.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/OpenRTS.Server/OpenRTS.Server.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/OpenRTS.Server.Tests/OpenRTS.Server.Tests.csproj" />
+  </Folder>
+</Solution>

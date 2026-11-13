@@ -1,0 +1,7 @@
+{
+  "name": "com.openrts.shared",
+  "version": "0.1.0",
+  "displayName": "OpenRTS Shared",
+  "description": "Code shared between the OpenRTS server and Unity client (protocol, simulation constants).",
+  "unity": "6000.6"
+}

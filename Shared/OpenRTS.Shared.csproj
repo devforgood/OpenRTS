@@ -1,0 +1,22 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+
+  <!--
+    서버와 Unity 클라이언트가 함께 쓰는 코드(프로토콜, 시뮬레이션 상수 등).
+    - .NET: 서버가 이 프로젝트를 ProjectReference 로 참조한다.
+    - Unity: 이 폴더 전체가 로컬 패키지(com.openrts.shared)이고, Runtime/ 의 소스를 asmdef 로 직접 컴파일한다.
+    Unity 호환을 위해 netstandard2.1 / C# 9 로 고정한다. 여기서 빌드되면 Unity에서도 컴파일된다.
+    UnityEngine 이나 서버 전용 라이브러리를 참조하지 않는다.
+  -->
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>9.0</LangVersion>
+    <Nullable>enable</Nullable>
+    <RootNamespace>OpenRTS.Shared</RootNamespace>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Remove="**/*.cs" />
+    <Compile Include="Runtime/**/*.cs" />
+  </ItemGroup>
+
+</Project>

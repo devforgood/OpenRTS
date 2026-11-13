@@ -1,0 +1,36 @@
+# ---------- .NET (Server, Shared) ----------
+# 빌드 출력은 Directory.Build.props 설정으로 artifacts/ 에 모인다.
+artifacts/
+# IDE 등이 artifacts 설정 없이 빌드했을 때를 대비
+**/bin/
+**/obj/
+**/TestResults/
+*.user
+*.suo
+.vs/
+
+# ---------- Unity (Client) ----------
+Client/[Ll]ibrary/
+Client/[Tt]emp/
+Client/[Oo]bj/
+Client/[Bb]uild/
+Client/[Bb]uilds/
+Client/[Ll]ogs/
+Client/[Uu]ser[Ss]ettings/
+Client/[Mm]emoryCaptures/
+Client/[Rr]ecordings/
+# Unity가 자동 생성하는 IDE 파일
+Client/*.sln
+Client/*.slnx
+Client/*.csproj
+Client/.vsconfig
+Client/.idea/
+Client/*.pidb.meta
+Client/*.pdb.meta
+Client/*.mdb.meta
+Client/crashlytics-build.properties
+
+# ---------- 기타 ----------
+.DS_Store
+Thumbs.db
+.idea/

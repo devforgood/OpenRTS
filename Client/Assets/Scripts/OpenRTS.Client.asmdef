@@ -1,0 +1,16 @@
+{
+    "name": "OpenRTS.Client",
+    "rootNamespace": "OpenRTS.Client",
+    "references": [
+        "OpenRTS.Shared"
+    ],
+    "includePlatforms": [],
+    "excludePlatforms": [],
+    "allowUnsafeCode": false,
+    "overrideReferences": false,
+    "precompiledReferences": [],
+    "autoReferenced": true,
+    "defineConstraints": [],
+    "versionDefines": [],
+    "noEngineReferences": false
+}

@@ -1,0 +1,10 @@
+<Project>
+  <!--
+    모든 .NET 프로젝트의 bin/obj 를 저장소 루트의 artifacts/ 로 모은다.
+    Shared/ 는 Unity 패키지이기도 해서, 그 안에 obj/*.cs 가 생기면 Unity가 중복 컴파일한다.
+  -->
+  <PropertyGroup>
+    <UseArtifactsOutput>true</UseArtifactsOutput>
+    <ArtifactsPath>$(MSBuildThisFileDirectory)artifacts</ArtifactsPath>
+  </PropertyGroup>
+</Project>
