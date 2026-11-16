@@ -32,16 +32,28 @@ namespace OpenRTS.Client
             var root = new GameObject("OpenRTS");
             var client = root.AddComponent<GameClient>();
 
+            var map = root.AddComponent<MapView>();
+            map.Client = client;
+
             var views = root.AddComponent<UnitViewManager>();
             views.Client = client;
+            views.Camera = camera;
+
+            var effects = root.AddComponent<CombatEffects>();
+            effects.Client = client;
+            effects.Views = views;
 
             var input = root.AddComponent<RtsInput>();
             input.Client = client;
+            input.Views = views;
             input.Camera = camera;
+            views.Selection = input.Selection;
 
             var hud = root.AddComponent<NetDebugHud>();
             hud.Client = client;
             hud.Views = views;
+            hud.Selection = input.Selection;
+
 
             var panel = root.AddComponent<SimSettingsPanel>();
             panel.Client = client;
@@ -59,6 +71,15 @@ namespace OpenRTS.Client
                 test.Client = client;
                 test.Views = views;
             }
+
+            if (BattleAutoTest.IsRequested())
+            {
+                var test = root.AddComponent<BattleAutoTest>();
+                test.Client = client;
+                test.Views = views;
+                test.Effects = effects;
+            }
+
         }
 
         private static Camera SetupCamera()

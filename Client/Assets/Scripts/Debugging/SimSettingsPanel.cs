@@ -1,4 +1,5 @@
 using OpenRTS.Client.Net;
+using OpenRTS.Shared.Map;
 using OpenRTS.Shared.Protocol;
 using UnityEngine;
 
@@ -15,11 +16,14 @@ namespace OpenRTS.Client.Debugging
         public GameClient Client;
         public bool Visible = true;
 
-        private Rect _rect = new Rect(0, 10, 340, 0);
+        private Rect _rect = new Rect(0, 10, 380, 0);
         private SimSettings _draft;
         private bool _hasDraft;
         private bool _dirty;
         private GUIStyle _statsStyle;
+
+        /// <summary>창 영역 (GUI 좌표, 숨기면 빈 영역). 이 위의 클릭은 유닛 선택으로 치지 않는다.</summary>
+        public static Rect Area { get; private set; }
 
         private void Start()
         {
@@ -56,10 +60,12 @@ namespace OpenRTS.Client.Debugging
         {
             if (!Visible || Client == null)
             {
+                Area = Rect.zero;
                 return;
             }
 
             _rect = GUILayout.Window(WindowId, _rect, DrawWindow, "Simulation (F2)", GUILayout.Width(_rect.width));
+            Area = _rect;
         }
 
         private void DrawWindow(int id)
@@ -73,9 +79,14 @@ namespace OpenRTS.Client.Debugging
 
             var before = _draft;
 
+            GUILayout.Label("<b>Map</b>", Rich());
+            _draft.Map = (MapKind)GUILayout.Toolbar((int)_draft.Map, new[] { "Open", "Gate", "Blocks" });
+            _draft.PlayerUnits = (byte)IntSlider("my units", _draft.PlayerUnits, 1, SimSettings.MaxPlayerUnits);
+
+            GUILayout.Space(4);
             GUILayout.Label("<b>Bots</b>", Rich());
             _draft.BotCount = (ushort)IntSlider("count", _draft.BotCount, 0, SimSettings.MaxBots);
-            _draft.Scenario = (BotScenario)GUILayout.Toolbar((int)_draft.Scenario, new[] { "Wander", "Converge", "Circle", "Cross" });
+            _draft.Scenario = (BotScenario)GUILayout.Toolbar((int)_draft.Scenario, new[] { "Wander", "Conv", "Circle", "Cross", "Pass", "Battle" });
 
             GUILayout.Space(4);
             GUILayout.Label("<b>Unit</b>", Rich());
@@ -92,6 +103,11 @@ namespace OpenRTS.Client.Debugging
             GUI.enabled = true;
             _draft.Separation = GUILayout.Toggle(_draft.Separation, " separation (push residual overlap)");
             _draft.StopWhenBlocked = GUILayout.Toggle(_draft.StopWhenBlocked, " stop when blocked");
+            _draft.RepathWhenBlocked = GUILayout.Toggle(_draft.RepathWhenBlocked, " repath around idle units when blocked");
+
+            GUILayout.Space(4);
+            GUILayout.Label("<b>Network</b>", Rich());
+            _draft.DeltaSnapshots = GUILayout.Toggle(_draft.DeltaSnapshots, " delta snapshots (send changed units only)");
 
             if (!_draft.Equals(before))
             {
@@ -120,6 +136,8 @@ namespace OpenRTS.Client.Debugging
                 _draft = SimSettings.Default;
                 _draft.BotCount = keep.BotCount;
                 _draft.Scenario = keep.Scenario;
+                _draft.Map = keep.Map;
+                _draft.PlayerUnits = keep.PlayerUnits;
                 _dirty = true;
             }
 
@@ -132,22 +150,36 @@ namespace OpenRTS.Client.Debugging
 
             GUILayout.Label("Presets (apply immediately)");
             GUILayout.BeginHorizontal();
-            Preset("Circle 100", BotScenario.CircleSwap, 100);
-            Preset("Circle 300", BotScenario.CircleSwap, 300);
-            Preset("Cross 200", BotScenario.Crossing, 200);
-            Preset("Conv 60", BotScenario.Converge, 60);
+            Preset("Circle 100", BotScenario.CircleSwap, 100, MapKind.Open);
+            Preset("Circle 300", BotScenario.CircleSwap, 300, MapKind.Open);
+            Preset("Cross 200", BotScenario.Crossing, 200, MapKind.Open);
+            Preset("Conv 60", BotScenario.Converge, 60, MapKind.Open);
             GUILayout.EndHorizontal();
+            GUILayout.BeginHorizontal();
+            Preset("Gate 50", BotScenario.Pass, 50, MapKind.Gate);
+            Preset("Gate 150", BotScenario.Pass, 150, MapKind.Gate);
+            Preset("Blocks 200", BotScenario.Wander, 200, MapKind.Blocks);
+            Preset("Gate (me)", BotScenario.Wander, 0, MapKind.Gate);
+            GUILayout.EndHorizontal();
+            GUILayout.BeginHorizontal();
+            Preset("Battle 60", BotScenario.Battle, 60, MapKind.Open);
+            Preset("Battle 200", BotScenario.Battle, 200, MapKind.Open);
+            Preset("Battle Gate", BotScenario.Battle, 200, MapKind.Gate);
+            Preset("Battle Blocks", BotScenario.Battle, 200, MapKind.Blocks);
+            GUILayout.EndHorizontal();
+
 
             DrawStats();
             GUI.DragWindow();
         }
 
-        private void Preset(string label, BotScenario scenario, int bots)
+        private void Preset(string label, BotScenario scenario, int bots, MapKind map)
         {
             if (GUILayout.Button(label))
             {
                 _draft.Scenario = scenario;
                 _draft.BotCount = (ushort)bots;
+                _draft.Map = map;
                 Client.SendSettings(_draft);
                 _dirty = false;
             }
@@ -170,8 +202,11 @@ namespace OpenRTS.Client.Debugging
                 $"units {s.UnitCount}  moving {s.MovingUnits}\n" +
                 $"min separation <color={sepColor}>{s.MinSeparationRatio:0.000}</color>  (distance / 2r, ≥1 no overlap)\n" +
                 $"overlapping pairs <color={overlapColor}>{s.OverlapPairs}</color>  (>5% penetration)\n" +
-                $"blocked stops {s.BlockedStops}   server step {s.StepMs:0.00} ms\n" +
-                $"snapshot parts lost {Client.SnapshotsIncomplete}",
+                $"blocked stops {s.BlockedStops}   repaths {s.Repaths}   wall hits <color={(s.WallPenetrations == 0 ? "lime" : "red")}>{s.WallPenetrations}</color>\n" +
+                $"server step {s.StepMs:0.00} ms\n" +
+                $"snapshot {s.SnapshotBytesPerSec / 1024f:0.0} KB/s per client (delta {s.DeltaRatio * 100:0}%)\n" +
+                $"snapshot parts lost {Client.SnapshotsIncomplete}  no baseline {Client.SnapshotsMissingBaseline}",
+
                 _statsStyle);
         }
 

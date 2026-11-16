@@ -9,7 +9,8 @@ namespace OpenRTS.Client.Debugging
 {
     /// <summary>
     /// 명령줄 <c>-autotest</c> 로 켜지는 이동 동기화 자동 확인.
-    /// 접속 → 내 유닛을 8유닛 옆으로 이동 → 화면(보간) 위치가 목표에 도착하는지, 중간에 튀지 않는지 확인 후 종료.
+    /// 접속 → 내 유닛 중 이동 방향 맨 끝 유닛 하나를 8유닛 옆으로 이동 → 화면(보간) 위치가 목표에 도착하는지,
+    /// 중간에 튀지 않는지 확인 후 종료.
     /// 결과는 로그에 "AUTOTEST PASS/FAIL" 로 남고 종료 코드 0/1 로 끝난다.
     /// </summary>
     public sealed class MovementAutoTest : MonoBehaviour
@@ -24,6 +25,7 @@ namespace OpenRTS.Client.Debugging
         private Vector2? _start;
         private Vector2 _target;
         private Vector2 _last;
+        private int _unitId = -1;
         private float _moveStartTime = -1f;
         private float _maxSpeed;
         private int _extrapolatedFrames;
@@ -50,29 +52,33 @@ namespace OpenRTS.Client.Debugging
                 return;
             }
 
-            if (Client.State != ClientState.Joined ||
-                !Views.InterpolatedPositions.TryGetValue(Client.MyUnitId, out var pos))
+            if (Client.State != ClientState.Joined || Client.MyUnits.Count == 0)
             {
                 return;
             }
 
-            _maxOtherUnits = Math.Max(_maxOtherUnits, Views.InterpolatedPositions.Count - 1);
+            _maxOtherUnits = Math.Max(_maxOtherUnits, Views.InterpolatedPositions.Count - Client.MyUnits.Count);
 
             if (_start == null)
             {
                 // 보간 버퍼가 차고 적응형 지연이 망 상태를 파악할 때까지 기다린 뒤 출발
-                if (_elapsed < 3f)
+                if (_elapsed < 3f || !TryPickUnit(out _unitId, out var dir))
                 {
                     return;
                 }
 
-                _start = pos;
-                var dir = pos.X > 0 ? -1f : 1f; // 맵 안쪽으로
-                _target = pos + new Vector2(dir * MoveDistance, 0);
-                _last = pos;
+                var p0 = Views.InterpolatedPositions[_unitId];
+                _start = p0;
+                _target = p0 + new Vector2(dir * MoveDistance, 0);
+                _last = p0;
                 _moveStartTime = _elapsed;
-                Client.SendMove(_target);
-                Debug.Log($"[AUTOTEST] start {pos} → target {_target}");
+                Client.SendMove(new[] { _unitId }, _target);
+                Debug.Log($"[AUTOTEST] unit {_unitId} start {p0} → target {_target} ({Client.MyUnits.Count} own units)");
+                return;
+            }
+
+            if (!Views.InterpolatedPositions.TryGetValue(_unitId, out var pos))
+            {
                 return;
             }
 
@@ -105,7 +111,43 @@ namespace OpenRTS.Client.Debugging
                 $"interp delay {Client.Interpolator.InterpolationDelay * 1000:0} ms");
         }
 
+        /// <summary>무리 중심이 맵 안쪽으로 가는 방향을 정하고, 그 방향 맨 끝 유닛을 고른다 (가는 길에 아군이 없게).</summary>
+        private bool TryPickUnit(out int unitId, out float dir)
+        {
+            unitId = -1;
+            dir = 1f;
+            var sumX = 0f;
+            var count = 0;
+            foreach (var id in Client.MyUnits)
+            {
+                if (Views.InterpolatedPositions.TryGetValue(id, out var p))
+                {
+                    sumX += p.X;
+                    count++;
+                }
+            }
+
+            if (count == 0)
+            {
+                return false;
+            }
+
+            dir = sumX / count > 0 ? -1f : 1f; // 맵 안쪽으로
+            var best = float.MinValue;
+            foreach (var id in Client.MyUnits)
+            {
+                if (Views.InterpolatedPositions.TryGetValue(id, out var p) && dir * p.X > best)
+                {
+                    best = dir * p.X;
+                    unitId = id;
+                }
+            }
+
+            return unitId >= 0;
+        }
+
         private void Finish(bool ok, string detail)
+
         {
             _done = true;
             Debug.Log($"AUTOTEST {(ok ? "PASS" : "FAIL")}: {detail}");

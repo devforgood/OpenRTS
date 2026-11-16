@@ -13,7 +13,7 @@ namespace OpenRTS.Server.Tests;
 public sealed class GameServerIntegrationTests : IDisposable
 {
     private readonly GameServer _server;
-    private uint _tick;
+    private uint _tick = 1;
 
     public GameServerIntegrationTests()
     {
@@ -25,36 +25,85 @@ public sealed class GameServerIntegrationTests : IDisposable
 
     public void Dispose() => _server.Dispose();
 
+    private static int PlayerUnits => SimSettings.Default.PlayerUnits;
+
     [Fact]
-    public void Client_Joins_Moves_AndSeesItsPositionInSnapshots()
+    public void Client_Joins_GetsSquad_AndMovesOneUnit()
     {
         using var client = new TestClient(_server.Port);
 
-        RunUntil(() => client.Welcome is not null && client.Settings is not null, client);
-        var unitId = client.Welcome!.Value.UnitId;
+        RunUntil(() => client.Settings is not null && client.MyUnits().Count == PlayerUnits, client);
+        var unitId = client.MyUnits()[0];
         var start = _server.World.Find(unitId)!.Position;
-        var target = start + new Vector2(3, 0);
+        var target = start + new Vector2(0, -3); // 무리(격자) 밖으로
 
-        client.SendMove(target);
-        // 3유닛 / 6유닛/초 = 0.5초 = 15틱. 여유를 두고 기다린다. 스냅샷은 16비트 양자화라 0.01 이내면 같은 위치.
-        RunUntil(() => client.LastSnapshot.TryGetValue(unitId, out var p) && Vector2.Distance(p, target) < 0.01f, client);
+        client.SendMove(target, unitId);
+        // 스냅샷은 16비트 양자화라 0.01 이내면 같은 위치.
+        RunUntil(() => client.LastSnapshot.TryGetValue(unitId, out var u) && Vector2.Distance(u.Position, target) < 0.01f, client);
 
         Assert.True(Vector2.Distance(target, _server.World.Find(unitId)!.Position) <= World.ArrivalDistance);
         Assert.Equal(0u, client.LastSnapshotTick % SimConstants.TicksPerSnapshot);
     }
 
     [Fact]
-    public void TwoClients_SeeEachOther_AndDisconnectRemovesUnit()
+    public void GroupMove_SpreadsIntoFormation_AndEveryoneArrives()
+    {
+        using var client = new TestClient(_server.Port);
+        RunUntil(() => client.MyUnits().Count == PlayerUnits, client);
+        var ids = client.MyUnits();
+        var target = new Vector2(-20, 15);
+
+        client.SendMove(target, ids.ToArray());
+        RunUntil(() => ids.Any(id => _server.World.Find(id)!.IsMoving), client);
+        RunUntil(() => ids.All(id => !_server.World.Find(id)!.IsMoving), client);
+
+
+        var positions = ids.Select(id => _server.World.Find(id)!.Position).ToList();
+        var r = _server.World.Settings.UnitRadius;
+        Assert.All(positions, p => Assert.True(Vector2.Distance(p, target) < 4f, $"{p} far from {target}"));
+        for (var i = 0; i < positions.Count; i++)
+        {
+            for (var j = i + 1; j < positions.Count; j++)
+            {
+                Assert.True(Vector2.Distance(positions[i], positions[j]) > 2 * r * 0.95f, "units overlap at destination");
+            }
+        }
+
+        Assert.Equal(0, _server.World.BlockedStops); // 대형 칸이 있으니 서로 밀치다 포기하지 않는다
+    }
+
+    [Fact]
+    public void Client_CannotCommandOtherPlayersUnits()
+    {
+        using var a = new TestClient(_server.Port);
+        using var b = new TestClient(_server.Port);
+        RunUntil(() => a.MyUnits().Count == PlayerUnits && b.MyUnits().Count == PlayerUnits && a.LastSnapshot.Count == 2 * PlayerUnits, a, b);
+
+        var victim = b.MyUnits()[0];
+        a.SendMove(new Vector2(40, 40), victim);
+        for (var i = 0; i < 30; i++)
+        {
+            Step(a, b);
+        }
+
+        // 두 플레이어는 다른 팀이라 서로 싸우며 움직일 수는 있지만, a 가 찍은 곳으로 가지는 않는다.
+        var unit = _server.World.Find(victim);
+        Assert.True(unit is null || unit.Target is not { } t || Vector2.Distance(t, new Vector2(40, 40)) > 5f);
+
+    }
+
+    [Fact]
+    public void TwoClients_SeeEachOther_AndDisconnectRemovesUnits()
     {
         using var a = new TestClient(_server.Port);
         var b = new TestClient(_server.Port);
 
         RunUntil(() => a.Welcome is not null && b.Welcome is not null, a, b);
-        var bUnit = b.Welcome!.Value.UnitId;
-        RunUntil(() => a.LastSnapshot.ContainsKey(bUnit), a, b);
+        var bPlayer = b.Welcome!.Value.PlayerId;
+        RunUntil(() => a.LastSnapshot.Values.Count(u => u.Owner == bPlayer) == PlayerUnits, a, b);
 
         b.Dispose();
-        RunUntil(() => _server.PlayerCount == 1 && !a.LastSnapshot.ContainsKey(bUnit), a);
+        RunUntil(() => _server.PlayerCount == 1 && a.LastSnapshot.Values.All(u => u.Owner != bPlayer), a);
     }
 
     [Fact]
@@ -75,32 +124,116 @@ public sealed class GameServerIntegrationTests : IDisposable
         RunUntil(() => a.Settings is not null && b.Settings is not null, a, b);
 
         var requested = a.Settings!.Value;
-        requested.BotCount = 450; // 스냅샷 3조각
+        requested.BotCount = 450; // 전체 스냅샷이면 4조각
         requested.Scenario = BotScenario.CircleSwap;
         requested.UnitRadius = 0.4f;
         a.SendSettings(requested);
 
-        // 두 클라이언트 모두 새 설정을 받고, 봇 450 + 플레이어 2 가 담긴 완성 스냅샷을 받는다.
-        RunUntil(() => b.Settings is { BotCount: 450 } && b.LastSnapshot.Count == 452 && a.LastSnapshot.Count == 452, a, b);
+        // 두 클라이언트 모두 새 설정을 받고, 봇 450 + 플레이어 유닛이 담긴 완성 스냅샷을 받는다.
+        var expected = 450 + 2 * PlayerUnits;
+        RunUntil(() => b.Settings is { BotCount: 450 } && b.LastSnapshot.Count == expected && a.LastSnapshot.Count == expected, a, b);
         Assert.Equal(BotScenario.CircleSwap, b.Settings!.Value.Scenario);
         Assert.Equal(0.4f, b.Settings!.Value.UnitRadius);
 
-        RunUntil(() => b.Stats is { UnitCount: 452 }, a, b);
+        RunUntil(() => b.Stats is { } s && s.UnitCount == expected, a, b);
+    }
+
+    [Fact]
+    public void DeltaSnapshots_MatchServerState_AndCostFarLessWhenIdle()
+    {
+        using var client = new TestClient(_server.Port);
+        var settings = SimSettings.Default;
+        settings.BotCount = 200;
+        settings.Scenario = BotScenario.CircleSwap;
+        RunUntil(() => client.Settings is not null, client);
+        client.SendSettings(settings);
+        RunUntil(() => client.Settings is { BotCount: 200 } && client.LastSnapshot.Count == 200 + PlayerUnits, client);
+
+        // 움직이는 중: 클라이언트가 복원한 상태가 서버 상태(양자화 값)와 정확히 같아야 한다.
+        for (var i = 0; i < 60; i++)
+        {
+            Step(client);
+        }
+
+        RunUntil(() => client.Receiver.DeltaReceived > 10, client);
+        AssertClientMatchesServer(client);
+        Assert.Equal(0, client.Receiver.MissingBaseline);
+
+        // 전부 멈추게 한 뒤(회피 끔 + 봇 0 + 내 유닛 정지) 대역폭 비교
+        settings.BotCount = 0;
+        client.SendSettings(settings);
+        RunUntil(() => client.Settings is { BotCount: 0 } && client.LastSnapshot.Count == PlayerUnits, client);
+        for (var i = 0; i < 20; i++)
+        {
+            Step(client); // 봇 제거분이 담긴 델타가 지나갈 때까지
+        }
+
+        var bytesBefore = _server.TotalSnapshotBytes;
+
+        for (var i = 0; i < 60; i++)
+        {
+            Step(client);
+        }
+
+        var idleBytesPerSnapshot = (_server.TotalSnapshotBytes - bytesBefore) / 30.0;
+        var fullBytes = SnapshotMessage.HeaderSize + PlayerUnits * SnapshotMessage.FullEntrySize;
+        Assert.True(idleBytesPerSnapshot < fullBytes / 2.0, $"idle snapshot {idleBytesPerSnapshot:0} bytes vs full {fullBytes}");
+        AssertClientMatchesServer(client);
+    }
+
+    [Fact]
+    public void Battle_OverNetwork_ClientSeesDamageEventsAndWinner()
+    {
+        using var client = new TestClient(_server.Port);
+        RunUntil(() => client.Settings is not null && client.MyUnits().Count == PlayerUnits, client);
+        var settings = client.Settings!.Value;
+        settings.Scenario = BotScenario.Battle;
+        settings.BotCount = 40;
+        client.SendSettings(settings);
+
+        RunUntil(() => client.Settings is { Scenario: BotScenario.Battle } && client.LastSnapshot.Count == 40 + PlayerUnits, client);
+        Assert.All(client.LastSnapshot.Values, u => Assert.InRange(u.Team, (byte)1, (byte)2));
+        Assert.Equal(_server.World.TeamOf(client.Welcome!.Value.PlayerId), client.LastSnapshot[client.MyUnits()[0]].Team);
+
+        RunUntil(() => client.Stats is { Winner: not 0 }, client);
+        Assert.Contains(client.Events, e => e.Type == CombatEventType.ProjectileLaunch);
+        Assert.Contains(client.Events, e => e.Type == CombatEventType.MeleeHit);
+        Assert.True(client.Events.Count(e => e.Type == CombatEventType.Death) >= 20);
+        Assert.True(client.SawDamage);
+        AssertClientMatchesServer(client); // 체력·공격 대상까지 서버가 보낸 값과 같다
+    }
+
+    private void AssertClientMatchesServer(TestClient client)
+    {
+        // 클라이언트가 마지막으로 복원한 틱에 서버가 실제로 보낸 상태와 비교한다.
+        Assert.True(_server.TryGetSentSnapshot(client.LastSnapshotTick, out var sent));
+        var server = sent.ToDictionary(e => (int)e.Id);
+        Assert.Equal(server.Count, client.LastSnapshot.Count);
+        foreach (var (id, state) in client.LastSnapshot)
+        {
+            Assert.Equal(server[id], SnapshotEntry.From(state));
+        }
+
+    }
+
+    private void Step(params TestClient[] clients)
+    {
+        _server.Tick(_tick++);
+        foreach (var c in clients)
+        {
+            c.Poll();
+        }
+
+        Thread.Sleep(2);
     }
 
     private void RunUntil(Func<bool> condition, params TestClient[] clients)
     {
-        var deadline = DateTime.UtcNow.AddSeconds(10);
+        var deadline = DateTime.UtcNow.AddSeconds(60);
         while (!condition())
         {
             Assert.True(DateTime.UtcNow < deadline, "timed out");
-            _server.Tick(_tick++);
-            foreach (var c in clients)
-            {
-                c.Poll();
-            }
-
-            Thread.Sleep(2);
+            Step(clients);
         }
     }
 
@@ -108,8 +241,6 @@ public sealed class GameServerIntegrationTests : IDisposable
     {
         private readonly NetManager _net;
         private readonly PacketWriter _writer = new();
-        private readonly List<UnitState> _part = new();
-        private readonly SnapshotAssembler _assembler = new();
         private NetPeer? _peer;
 
         public TestClient(int port, int protocolVersion = SimConstants.ProtocolVersion)
@@ -137,12 +268,20 @@ public sealed class GameServerIntegrationTests : IDisposable
                     case MessageType.SimStats:
                         Stats = SimStats.Read(ref r);
                         break;
+                    case MessageType.CombatEvents:
+                        var batch = new List<CombatEvent>();
+                        CombatEventsMessage.Read(ref r, batch);
+                        Events.AddRange(batch);
+                        break;
                     case MessageType.Snapshot:
-                        var tick = SnapshotMessage.ReadPart(ref r, _part, out var part, out var count);
-                        if (_assembler.Add(tick, part, count, _part, out var done, out var units))
+                        if (Receiver.Receive(ref r, out var tick, out var units))
                         {
-                            LastSnapshotTick = done;
-                            LastSnapshot = units.ToDictionary(u => u.Id, u => u.Position);
+                            LastSnapshotTick = tick;
+                            LastSnapshot = units.ToDictionary(u => u.Id);
+                            SawDamage |= units.Any(u => u.Team != 0 && u.Health < 0.999f);
+                            _writer.Reset();
+                            new SnapshotAck { Tick = tick }.Write(_writer);
+                            _peer!.Send(_writer.Buffer, 0, _writer.Length, DeliveryMethod.Unreliable);
                         }
 
                         break;
@@ -154,19 +293,27 @@ public sealed class GameServerIntegrationTests : IDisposable
             _net.Connect("127.0.0.1", port, SimConstants.ConnectionKey);
         }
 
+        public SnapshotReceiver Receiver { get; } = new();
+        public List<CombatEvent> Events { get; } = new();
+        public bool SawDamage { get; private set; }
+
         public ServerWelcome? Welcome { get; private set; }
         public SimSettings? Settings { get; private set; }
         public SimStats? Stats { get; private set; }
-        public Dictionary<int, Vector2> LastSnapshot { get; private set; } = new();
+        public Dictionary<int, UnitState> LastSnapshot { get; private set; } = new();
         public uint LastSnapshotTick { get; private set; }
         public bool Disconnected { get; private set; }
 
+        public List<int> MyUnits() => Welcome is { } w
+            ? LastSnapshot.Values.Where(u => u.Owner == w.PlayerId).Select(u => u.Id).Order().ToList()
+            : new List<int>();
+
         public void Poll() => _net.PollEvents();
 
-        public void SendMove(Vector2 target)
+        public void SendMove(Vector2 target, params int[] unitIds)
         {
             _writer.Reset();
-            new MoveCommand { Target = target }.Write(_writer);
+            new UnitCommand { Type = CommandType.Move, Target = target, UnitIds = unitIds }.Write(_writer);
             _peer!.Send(_writer.Buffer, 0, _writer.Length, DeliveryMethod.ReliableOrdered);
         }
 

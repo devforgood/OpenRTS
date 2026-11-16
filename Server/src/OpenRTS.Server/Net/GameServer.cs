@@ -16,14 +16,33 @@ public sealed class GameServer : IDisposable
     /// <summary>지표(SimStats) 전송 간격 (틱).</summary>
     public const int TicksPerStats = SimConstants.TickRate / 2;
 
+    /// <summary>델타 기준으로 쓸 수 있는 과거 스냅샷 수 (15Hz 기준 약 4초).</summary>
+    public const int HistorySize = 64;
+
+    private sealed class Session
+    {
+        public byte PlayerId;
+        public uint LastAck;
+    }
+
     private readonly NetManager _net;
-    private readonly Dictionary<int, int> _peerUnits = new(); // peer.Id → unitId
+    private readonly Dictionary<int, Session> _sessions = new(); // peer.Id → 세션 (입장한 피어만)
     private readonly List<NetPeer> _peers = new();
     private readonly PacketWriter _writer = new();
     private readonly Action<string> _log;
     private readonly Stopwatch _stepWatch = new();
+    private readonly SnapshotHistory _history = new(HistorySize);
+    private readonly List<SnapshotEntry> _current = new();
+    private readonly Dictionary<uint, List<SnapshotEntry>> _deltas = new(); // baseline 틱 → 변경분 (한 스냅샷 안에서 재사용)
+    private readonly Stack<List<SnapshotEntry>> _deltaPool = new();
+    private readonly List<(int Start, int Count)> _parts = new();
+    private readonly List<CombatEvent> _pendingEvents = new();
+    private float _commandDelayMs;
     private double _stepMsTotal;
     private int _stepSamples;
+    private long _snapshotBytes;
+    private int _snapshotSends;
+    private int _deltaSends;
 
     public GameServer(World world, Action<string>? log = null, bool allowDebugCommands = true)
     {
@@ -50,7 +69,10 @@ public sealed class GameServer : IDisposable
     /// <summary>실제로 바인딩된 포트 (0 으로 시작하면 OS가 고른 포트).</summary>
     public int Port => _net.LocalPort;
 
-    public int PlayerCount => _peerUnits.Count;
+    public int PlayerCount => _sessions.Count;
+
+    /// <summary>시작 후 보낸 스냅샷 바이트 합계 (모든 피어).</summary>
+    public long TotalSnapshotBytes { get; private set; }
 
     public void Start(int port)
     {
@@ -68,13 +90,17 @@ public sealed class GameServer : IDisposable
         _net.PollEvents();
 
         _stepWatch.Restart();
-        World.Step(SimConstants.TickDelta);
+        World.Step(SimConstants.TickDelta, tick);
         _stepMsTotal += _stepWatch.Elapsed.TotalMilliseconds;
         _stepSamples++;
+
+        _pendingEvents.AddRange(World.Combat.Events);
+        World.Combat.ClearEvents();
 
         if (tick % SimConstants.TicksPerSnapshot == 0)
         {
             BroadcastSnapshot(tick);
+            BroadcastCombatEvents();
         }
 
         if (tick % TicksPerStats == 0)
@@ -85,51 +111,112 @@ public sealed class GameServer : IDisposable
 
     public void Dispose() => _net.Stop();
 
+    /// <summary>최근 보낸 스냅샷 상태 (ID 순, 양자화 값). 테스트·디버그용.</summary>
+    public bool TryGetSentSnapshot(uint tick, out IReadOnlyList<SnapshotEntry> state) => _history.TryGet(tick, out state);
+
+
     private void BroadcastSnapshot(uint tick)
     {
-        if (_peerUnits.Count == 0)
+        if (_sessions.Count == 0)
         {
             return;
         }
 
-        var state = World.CaptureState();
-        _net.GetConnectedPeers(_peers);
+        _current.Clear();
+        foreach (var u in World.CaptureState())
+        {
+            _current.Add(SnapshotEntry.From(u));
+        }
 
-        // 조각 크기는 모든 피어가 쪼개지 않고 받을 수 있는 크기에 맞춘다 (MTU 탐색 전에는 작다).
-        var maxPacket = int.MaxValue;
+        _current.Sort(SnapshotDelta.ById);
+
+        foreach (var list in _deltas.Values)
+        {
+            _deltaPool.Push(list);
+        }
+
+        _deltas.Clear();
+        _net.GetConnectedPeers(_peers);
         foreach (var peer in _peers)
         {
-            if (_peerUnits.ContainsKey(peer.Id))
+            if (!_sessions.TryGetValue(peer.Id, out var session))
             {
-                maxPacket = Math.Min(maxPacket, peer.GetMaxSinglePacketSize(DeliveryMethod.Unreliable));
+                continue;
+            }
+
+            // 기준: 클라이언트가 마지막으로 확인한 스냅샷. 없거나 너무 오래됐으면 전체를 보낸다.
+            var baseTick = SnapshotMessage.NoBaseline;
+            IReadOnlyList<SnapshotEntry> entries = _current;
+            if (World.Settings.DeltaSnapshots && _history.TryGet(session.LastAck, out var baseline))
+            {
+                baseTick = session.LastAck;
+                if (!_deltas.TryGetValue(baseTick, out var delta))
+                {
+                    delta = _deltaPool.Count > 0 ? _deltaPool.Pop() : new List<SnapshotEntry>();
+                    SnapshotDelta.Diff(baseline, _current, delta);
+                    _deltas.Add(baseTick, delta);
+                }
+
+                entries = delta;
+                _deltaSends++;
+            }
+
+            _snapshotSends++;
+
+            // 조각 크기는 이 피어가 쪼개지 않고 받을 수 있는 크기에 맞춘다 (MTU 탐색 전에는 작다).
+            SnapshotMessage.Plan(entries, peer.GetMaxSinglePacketSize(DeliveryMethod.Unreliable), _parts);
+            for (var part = 0; part < _parts.Count; part++)
+            {
+                _writer.Reset();
+                SnapshotMessage.WritePart(_writer, tick, baseTick, entries, _parts[part].Start, _parts[part].Count, part, _parts.Count);
+                peer.Send(_writer.Buffer, 0, _writer.Length, DeliveryMethod.Unreliable);
+                _snapshotBytes += _writer.Length;
+                TotalSnapshotBytes += _writer.Length;
             }
         }
 
-        var unitsPerPart = SnapshotMessage.UnitsPerPart(maxPacket);
-        var parts = SnapshotMessage.PartCount(state.Count, unitsPerPart);
-        for (var part = 0; part < parts; part++)
+        _history.Store(tick, _current);
+    }
+
+    /// <summary>쌓인 전투 이벤트를 연출용으로 보낸다 (unreliable, 패킷 크기에 맞춰 나눔).</summary>
+    private void BroadcastCombatEvents()
+    {
+        if (_pendingEvents.Count == 0 || _sessions.Count == 0)
+        {
+            _pendingEvents.Clear();
+            return;
+        }
+
+        for (var start = 0; start < _pendingEvents.Count; start += CombatEventsMessage.MaxPerPacket)
         {
             _writer.Reset();
-            SnapshotMessage.WritePart(_writer, tick, state, part, unitsPerPart);
+            CombatEventsMessage.Write(_writer, _pendingEvents, start, Math.Min(CombatEventsMessage.MaxPerPacket, _pendingEvents.Count - start));
             SendToJoined(DeliveryMethod.Unreliable);
         }
+
+        _pendingEvents.Clear();
     }
 
     private void BroadcastStats()
     {
-        if (_peerUnits.Count == 0)
+        if (_sessions.Count == 0)
         {
             return;
         }
 
         var stats = World.ComputeStats();
         stats.StepMs = _stepSamples > 0 ? (float)(_stepMsTotal / _stepSamples) : 0f;
+        stats.SnapshotBytesPerSec = (float)(_snapshotBytes / (TicksPerStats * (double)SimConstants.TickDelta) / _sessions.Count);
+        stats.DeltaRatio = _snapshotSends > 0 ? (float)_deltaSends / _snapshotSends : 0f;
+        stats.CommandDelayMs = _commandDelayMs;
         _stepMsTotal = 0;
         _stepSamples = 0;
+        _snapshotBytes = 0;
+        _snapshotSends = 0;
+        _deltaSends = 0;
 
         _writer.Reset();
         stats.Write(_writer);
-        _net.GetConnectedPeers(_peers);
         SendToJoined(DeliveryMethod.Unreliable);
     }
 
@@ -137,16 +224,16 @@ public sealed class GameServer : IDisposable
     {
         _writer.Reset();
         World.Settings.Write(_writer, MessageType.SimSettings);
-        _net.GetConnectedPeers(_peers);
         SendToJoined(DeliveryMethod.ReliableOrdered);
     }
 
-    /// <summary>_writer 내용을 _peers 중 입장한 피어에게 보낸다.</summary>
+    /// <summary>_writer 내용을 입장한 피어 모두에게 보낸다.</summary>
     private void SendToJoined(DeliveryMethod method)
     {
+        _net.GetConnectedPeers(_peers);
         foreach (var peer in _peers)
         {
-            if (_peerUnits.ContainsKey(peer.Id))
+            if (_sessions.ContainsKey(peer.Id))
             {
                 peer.Send(_writer.Buffer, 0, _writer.Length, method);
             }
@@ -165,15 +252,32 @@ public sealed class GameServer : IDisposable
                 return;
             }
 
-            if (!_peerUnits.TryGetValue(peer.Id, out var unitId))
+            if (!_sessions.TryGetValue(peer.Id, out var session))
             {
                 return; // 입장 전 메시지는 무시
             }
 
             switch (type)
             {
-                case MessageType.MoveCommand:
-                    World.SetMoveTarget(unitId, MoveCommand.Read(ref r).Target);
+                case MessageType.UnitCommand:
+                    var command = UnitCommand.Read(ref r);
+                    World.Command(session.PlayerId, command);
+                    if (command.ClientTick != 0 && command.ClientTick <= CurrentTick + SimConstants.TickRate)
+                    {
+                        // 클라이언트가 추정한 서버 틱과 실제 받은 틱의 차이 = 대략 편도 지연 (최근 값 쪽으로 이동 평균)
+                        var delayMs = ((long)CurrentTick - command.ClientTick) * SimConstants.TickDelta * 1000f;
+                        _commandDelayMs = _commandDelayMs == 0 ? delayMs : _commandDelayMs * 0.7f + delayMs * 0.3f;
+                    }
+
+                    break;
+
+                case MessageType.SnapshotAck:
+                    var ack = SnapshotAck.Read(ref r).Tick;
+                    if (ack > session.LastAck && ack <= CurrentTick)
+                    {
+                        session.LastAck = ack;
+                    }
+
                     break;
 
                 case MessageType.SetSimSettings:
@@ -217,18 +321,25 @@ public sealed class GameServer : IDisposable
             return;
         }
 
-        if (_peerUnits.ContainsKey(peer.Id))
+        if (_sessions.ContainsKey(peer.Id))
         {
             return;
         }
 
-        var unit = World.SpawnRandom();
-        _peerUnits[peer.Id] = unit.Id;
+        if (!TryAllocatePlayerId(out var playerId))
+        {
+            _log($"peer {peer.Id}: server full, rejecting");
+            peer.Disconnect();
+            return;
+        }
+
+        var units = World.AddPlayer(playerId);
+        _sessions[peer.Id] = new Session { PlayerId = playerId };
 
         _writer.Reset();
         new ServerWelcome
         {
-            UnitId = unit.Id,
+            PlayerId = playerId,
             ServerTick = CurrentTick,
             TickRate = SimConstants.TickRate,
             SnapshotRate = SimConstants.SnapshotRate,
@@ -238,14 +349,30 @@ public sealed class GameServer : IDisposable
         _writer.Reset();
         World.Settings.Write(_writer, MessageType.SimSettings);
         peer.Send(_writer.Buffer, 0, _writer.Length, DeliveryMethod.ReliableOrdered);
-        _log($"peer {peer.Id} joined as unit {unit.Id}");
+        _log($"peer {peer.Id} joined as player {playerId} (team {World.TeamOf(playerId)}) with {units.Count} units");
+
+    }
+
+    private bool TryAllocatePlayerId(out byte playerId)
+    {
+        for (var id = 1; id < byte.MaxValue; id++)
+        {
+            if (_sessions.Values.All(s => s.PlayerId != id))
+            {
+                playerId = (byte)id;
+                return true;
+            }
+        }
+
+        playerId = 0;
+        return false;
     }
 
     private void OnPeerDisconnected(NetPeer peer, DisconnectInfo info)
     {
-        if (_peerUnits.Remove(peer.Id, out var unitId))
+        if (_sessions.Remove(peer.Id, out var session))
         {
-            World.Remove(unitId);
+            World.RemovePlayer(session.PlayerId);
         }
 
         _log($"peer {peer.Id} disconnected ({info.Reason})");

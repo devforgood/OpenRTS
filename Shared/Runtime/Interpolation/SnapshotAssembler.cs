@@ -9,9 +9,10 @@ namespace OpenRTS.Shared.Interpolation
     /// </summary>
     public sealed class SnapshotAssembler
     {
-        private readonly List<UnitState> _units = new List<UnitState>();
+        private readonly List<SnapshotEntry> _units = new List<SnapshotEntry>();
         private bool[] _received = new bool[0];
         private uint _tick;
+        private uint _baseTick;
         private bool _active;
         private int _receivedCount;
         private int _partCount;
@@ -22,10 +23,10 @@ namespace OpenRTS.Shared.Interpolation
         public int IncompleteDropped { get; private set; }
 
         /// <summary>
-        /// 조각을 추가한다. 이 조각으로 틱이 완성되면 true 와 함께 전체 유닛 목록을 돌려준다
-        /// (반환한 리스트는 다음 호출 때 재사용된다).
+        /// 조각을 추가한다. 이 조각으로 틱이 완성되면 true 와 함께 모든 조각의 항목을 돌려준다
+        /// (도착 순서대로 이어 붙인 것이라 ID 순이 아닐 수 있다. 반환한 리스트는 다음 호출 때 재사용된다).
         /// </summary>
-        public bool Add(uint tick, int part, int partCount, List<UnitState> partUnits, out uint completedTick, out IReadOnlyList<UnitState> units)
+        public bool Add(uint tick, uint baseTick, int part, int partCount, List<SnapshotEntry> partUnits, out uint completedTick, out List<SnapshotEntry> units)
         {
             completedTick = 0;
             units = _units; // 반환값이 false 면 내용은 의미 없음
@@ -42,9 +43,9 @@ namespace OpenRTS.Shared.Interpolation
                     IncompleteDropped++;
                 }
 
-                Begin(tick, partCount);
+                Begin(tick, baseTick, partCount);
             }
-            else if (tick < _tick || partCount != _partCount)
+            else if (tick < _tick || partCount != _partCount || baseTick != _baseTick)
             {
                 return false; // 이미 넘어간 틱의 늦은 조각, 또는 형식 불일치
             }
@@ -71,9 +72,10 @@ namespace OpenRTS.Shared.Interpolation
             return true;
         }
 
-        private void Begin(uint tick, int partCount)
+        private void Begin(uint tick, uint baseTick, int partCount)
         {
             _tick = tick;
+            _baseTick = baseTick;
             _partCount = partCount;
             _receivedCount = 0;
             _active = true;

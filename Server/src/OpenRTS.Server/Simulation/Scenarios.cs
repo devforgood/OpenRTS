@@ -1,5 +1,6 @@
 using System.Numerics;
 using OpenRTS.Shared;
+using OpenRTS.Shared.Combat;
 using OpenRTS.Shared.Protocol;
 
 namespace OpenRTS.Server.Simulation;
@@ -47,6 +48,15 @@ public static class Scenarios
 
                 break;
 
+            case BotScenario.Pass:
+                // 한 무리가 왼쪽 → 오른쪽. Gate 맵이면 가운데 좁은 통로를 지나야 한다.
+                foreach (var offset in Block(n, spacing))
+                {
+                    yield return (new Vector2(-30, 0) + offset, new Vector2(30, 0) + offset);
+                }
+
+                break;
+
             default: // Wander
                 foreach (var p in Block(n, spacing * 2))
                 {
@@ -55,6 +65,28 @@ public static class Scenarios
                 }
 
                 break;
+        }
+    }
+
+    /// <summary>
+    /// Battle: 봇을 반씩 1팀(왼쪽 x=-30)·2팀(오른쪽 x=+30)에 격자로 놓는다.
+    /// 상대 쪽 앞줄 절반은 근접, 뒷줄 절반은 원거리.
+    /// </summary>
+    public static IEnumerable<(Vector2 Position, byte Team, UnitKind Kind)> BattleLayout(SimSettings s)
+    {
+        var spacing = s.UnitRadius * 2f * 1.5f;
+        var perTeam = new[] { s.BotCount / 2, s.BotCount - s.BotCount / 2 };
+        for (var t = 0; t < 2; t++)
+        {
+            var team = (byte)(t + 1);
+            var facing = t == 0 ? 1f : -1f; // 상대 쪽 방향 (x)
+            var center = new Vector2(-30f * facing, 0);
+            var offsets = Block(perTeam[t], spacing).OrderByDescending(o => o.X * facing).ToList();
+            for (var i = 0; i < offsets.Count; i++)
+            {
+                var kind = i < (offsets.Count + 1) / 2 ? UnitKind.Melee : UnitKind.Ranged;
+                yield return (center + offsets[i], team, kind);
+            }
         }
     }
 

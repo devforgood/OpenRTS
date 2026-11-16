@@ -41,8 +41,10 @@ namespace OpenRTS.Client.Net
         public int SimulatedLossPercent;
 
         private readonly PacketWriter _writer = new PacketWriter();
-        private readonly List<UnitState> _snapshotUnits = new List<UnitState>();
-        private readonly SnapshotAssembler _assembler = new SnapshotAssembler();
+        private readonly SnapshotReceiver _receiver = new SnapshotReceiver();
+        private readonly List<int> _myUnits = new List<int>();
+        private readonly List<CombatEvent> _eventBuffer = new List<CombatEvent>();
+        private readonly List<CombatEvent> _pendingEvents = new List<CombatEvent>();
         private readonly Queue<DelayedPacket> _inbound = new Queue<DelayedPacket>();
         private readonly Queue<DelayedPacket> _outbound = new Queue<DelayedPacket>();
         private readonly System.Random _random = new System.Random();
@@ -50,11 +52,27 @@ namespace OpenRTS.Client.Net
         private NetPeer _peer;
 
         public ClientState State { get; private set; } = ClientState.Connecting;
-        public int MyUnitId { get; private set; } = -1;
+        /// <summary>서버가 정해 준 플레이어 번호 (입장 전 0). 스냅샷 Owner 가 이 값이면 내 유닛.</summary>
+        public byte PlayerId { get; private set; }
+
         public SnapshotInterpolator Interpolator { get; private set; }
 
         /// <summary>보간하지 않은 최신 스냅샷 (디버그 비교용).</summary>
         public Dictionary<int, Vector2> LatestRaw { get; } = new Dictionary<int, Vector2>();
+
+        /// <summary>최신 스냅샷의 유닛 상태 (소유자·팀·종류·체력·공격 대상). 위치는 보간 전 값.</summary>
+        public Dictionary<int, UnitState> Latest { get; } = new Dictionary<int, UnitState>();
+
+        /// <summary>내 팀 (내 유닛이 없으면 0). 서버가 입장 순서대로 1팀·2팀에 나눈다.</summary>
+        public byte MyTeam { get; private set; }
+
+        /// <summary>렌더 시점이 된 전투 이벤트 (보간 지연에 맞춰 늦게 재생). 받는 쪽이 비운다.</summary>
+        public List<CombatEvent> DueCombatEvents { get; } = new List<CombatEvent>();
+
+        public int CombatEventsReceived { get; private set; }
+
+        /// <summary>최신 스냅샷 기준 내 유닛 ID (오름차순).</summary>
+        public IReadOnlyList<int> MyUnits => _myUnits;
 
         /// <summary>LiteNetLib 가 잰 실제 왕복 지연 (시뮬레이션 지연 제외).</summary>
         public int NetworkRttMs => _peer != null ? _peer.RoundTripTime : 0;
@@ -63,7 +81,12 @@ namespace OpenRTS.Client.Net
         public int SnapshotsDroppedBySimulation { get; private set; }
 
         /// <summary>조각이 다 모이지 않아 버린 스냅샷 수.</summary>
-        public int SnapshotsIncomplete => _assembler.IncompleteDropped;
+        public int SnapshotsIncomplete => _receiver.IncompleteDropped;
+
+        /// <summary>기준 스냅샷이 없어 버린 델타 수 (기준이 오래돼 지워졌을 때).</summary>
+        public int SnapshotsMissingBaseline => _receiver.MissingBaseline;
+
+        public int DeltaSnapshotsReceived => _receiver.DeltaReceived;
 
         /// <summary>서버의 현재 시뮬레이션 설정 (입장 전에는 null).</summary>
         public SimSettings? Settings { get; private set; }
@@ -111,6 +134,33 @@ namespace OpenRTS.Client.Net
             }
 
             Interpolator?.Advance(Time.unscaledDeltaTime);
+            ReleaseDueEvents();
+        }
+
+        /// <summary>이벤트는 그 틱의 위치가 화면에 그려질 때(렌더 시각) 재생한다.</summary>
+        private void ReleaseDueEvents()
+        {
+            if (Interpolator == null || _pendingEvents.Count == 0)
+            {
+                return;
+            }
+
+            var renderTime = Interpolator.RenderTime;
+            for (var i = 0; i < _pendingEvents.Count; i++)
+            {
+                if (_pendingEvents[i].Tick * (double)SimConstants.TickDelta <= renderTime)
+                {
+                    DueCombatEvents.Add(_pendingEvents[i]);
+                    _pendingEvents.RemoveAt(i);
+                    i--;
+                }
+            }
+
+            // 너무 쌓이면(창이 멈췄다 돌아온 경우 등) 오래된 것부터 버린다.
+            if (_pendingEvents.Count > 2000)
+            {
+                _pendingEvents.RemoveRange(0, _pendingEvents.Count - 2000);
+            }
         }
 
         private void OnDestroy()
@@ -118,16 +168,40 @@ namespace OpenRTS.Client.Net
             _net?.Stop();
         }
 
-        public void SendMove(Vector2 target)
+        public bool IsMine(int unitId) => PlayerId != 0 && Latest.TryGetValue(unitId, out var u) && u.Owner == PlayerId;
+
+        /// <summary>나와 적인 유닛인지 (중립·같은 팀 제외).</summary>
+        public bool IsEnemy(int unitId) =>
+            MyTeam != 0 && Latest.TryGetValue(unitId, out var u) && OpenRTS.Shared.Combat.UnitArchetypes.AreEnemies(MyTeam, u.Team);
+
+        /// <summary>선택한 내 유닛들을 목표로 보낸다. 서버가 소유권을 다시 확인하고 대형을 짠다.</summary>
+        public void SendMove(IReadOnlyList<int> unitIds, Vector2 target) => SendCommand(CommandType.Move, unitIds, target, 0);
+
+        /// <summary>
+        /// 명령을 보낸다. 지금 추정한 서버 틱을 함께 실어 서버가 명령 지연을 잴 수 있게 한다.
+        /// 255개가 넘으면 나눠 보낸다.
+        /// </summary>
+        public void SendCommand(CommandType type, IReadOnlyList<int> unitIds, Vector2 target, int targetUnit)
         {
-            if (State != ClientState.Joined)
+            if (State != ClientState.Joined || unitIds == null || unitIds.Count == 0)
             {
                 return;
             }
 
-            _writer.Reset();
-            new MoveCommand { Target = target }.Write(_writer);
-            Send(_writer.ToArray(), DeliveryMethod.ReliableOrdered);
+            var clientTick = Interpolator != null ? (uint)Math.Max(1.0, Interpolator.ServerClock / SimConstants.TickDelta) : 0u;
+            for (var start = 0; start < unitIds.Count; start += UnitCommand.MaxUnits)
+            {
+                var count = Math.Min(UnitCommand.MaxUnits, unitIds.Count - start);
+                var chunk = new int[count];
+                for (var i = 0; i < count; i++)
+                {
+                    chunk[i] = unitIds[start + i];
+                }
+
+                _writer.Reset();
+                new UnitCommand { Type = type, Target = target, TargetUnit = targetUnit, ClientTick = clientTick, UnitIds = chunk }.Write(_writer);
+                Send(_writer.ToArray(), DeliveryMethod.ReliableOrdered);
+            }
         }
 
         /// <summary>서버에 설정 변경을 요청한다. 적용된 값은 SimSettings 메시지로 돌아온다.</summary>
@@ -199,27 +273,35 @@ namespace OpenRTS.Client.Net
                 {
                     case MessageType.ServerWelcome:
                         var welcome = ServerWelcome.Read(ref r);
-                        MyUnitId = welcome.UnitId;
+                        PlayerId = welcome.PlayerId;
                         Interpolator.MinInterpolationDelay = 2f / welcome.SnapshotRate;
                         State = ClientState.Joined;
-                        Debug.Log($"[OpenRTS] joined as unit {MyUnitId} (server tick {welcome.ServerTick}, {welcome.TickRate}Hz / snapshot {welcome.SnapshotRate}Hz)");
+                        Debug.Log($"[OpenRTS] joined as player {PlayerId} (server tick {welcome.ServerTick}, {welcome.TickRate}Hz / snapshot {welcome.SnapshotRate}Hz)");
                         Joined?.Invoke();
                         break;
 
                     case MessageType.Snapshot:
-                        var partTick = SnapshotMessage.ReadPart(ref r, _snapshotUnits, out var part, out var partCount);
-                        if (!_assembler.Add(partTick, part, partCount, _snapshotUnits, out var tick, out var units))
+                        if (!_receiver.Receive(ref r, out var tick, out var units))
                         {
                             break;
                         }
 
                         SnapshotsReceived++;
+                        SendAck(tick);
                         if (tick > Interpolator.LatestTick || Interpolator.BufferedCount == 0)
                         {
                             LatestRaw.Clear();
+                            Latest.Clear();
+                            _myUnits.Clear();
                             foreach (var u in units)
                             {
                                 LatestRaw[u.Id] = u.Position;
+                                Latest[u.Id] = u;
+                                if (PlayerId != 0 && u.Owner == PlayerId)
+                                {
+                                    _myUnits.Add(u.Id);
+                                    MyTeam = u.Team;
+                                }
                             }
                         }
 
@@ -236,6 +318,13 @@ namespace OpenRTS.Client.Net
                     case MessageType.SimStats:
                         Stats = SimStats.Read(ref r);
                         break;
+
+                    case MessageType.CombatEvents:
+                        CombatEventsMessage.Read(ref r, _eventBuffer);
+                        CombatEventsReceived += _eventBuffer.Count;
+                        _pendingEvents.AddRange(_eventBuffer);
+                        break;
+
                 }
             }
             catch (PacketFormatException e)
@@ -244,7 +333,16 @@ namespace OpenRTS.Client.Net
             }
         }
 
+        /// <summary>완성한 스냅샷 틱을 알린다. 서버는 이 틱을 기준으로 다음 델타를 만든다.</summary>
+        private void SendAck(uint tick)
+        {
+            _writer.Reset();
+            new SnapshotAck { Tick = tick }.Write(_writer);
+            Send(_writer.ToArray(), DeliveryMethod.Unreliable);
+        }
+
         private void ReadCommandLine()
+
         {
             var args = Environment.GetCommandLineArgs();
             for (var i = 0; i < args.Length - 1; i++)
