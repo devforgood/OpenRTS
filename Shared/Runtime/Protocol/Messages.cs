@@ -37,6 +37,9 @@ namespace OpenRTS.Shared.Protocol
 
         /// <summary>S→C 전투 이벤트 (타격·발사·사망 연출용). (unreliable)</summary>
         CombatEvents = 10,
+
+        /// <summary>S→C 이 플레이어의 자원과 생산 대기열. (unreliable, 5Hz)</summary>
+        PlayerState = 11,
     }
 
     public struct ClientHello
@@ -91,6 +94,15 @@ namespace OpenRTS.Shared.Protocol
 
         /// <summary>하던 일을 멈춘다.</summary>
         Stop = 3,
+
+        /// <summary>일꾼: 광맥(TargetUnit)을 캐서 본진에 나르기를 반복한다.</summary>
+        Gather = 4,
+
+        /// <summary>일꾼: Target 위치에 Kind 건물을 짓는다 (비용은 명령 때 낸다).</summary>
+        Build = 5,
+
+        /// <summary>건물: Kind 유닛을 생산 대기열에 넣는다 (비용은 넣을 때 낸다).</summary>
+        Train = 6,
     }
 
     /// <summary>선택한 내 유닛들에게 내리는 명령. 서버가 소유권을 확인하고, 이동이면 대형을 짠다.</summary>
@@ -109,6 +121,9 @@ namespace OpenRTS.Shared.Protocol
         /// </summary>
         public uint ClientTick;
 
+        /// <summary>Build·Train 에서 지을/만들 종류.</summary>
+        public Combat.UnitKind Kind;
+
         public IReadOnlyList<int> UnitIds;
 
         public void Write(PacketWriter w)
@@ -121,6 +136,7 @@ namespace OpenRTS.Shared.Protocol
             w.WriteFloat(Target.Y);
             w.WriteUShort((ushort)TargetUnit);
             w.WriteUInt(ClientTick);
+            w.WriteByte((byte)Kind);
             w.WriteByte((byte)count);
             for (var i = 0; i < count; i++)
             {
@@ -136,6 +152,7 @@ namespace OpenRTS.Shared.Protocol
                 Target = new Vector2(r.ReadFloat(), r.ReadFloat()),
                 TargetUnit = r.ReadUShort(),
                 ClientTick = r.ReadUInt(),
+                Kind = (Combat.UnitKind)r.ReadByte(),
             };
             if (!Enum.IsDefined(typeof(CommandType), cmd.Type))
             {
@@ -164,6 +181,70 @@ namespace OpenRTS.Shared.Protocol
 
         /// <summary>유닛 사망 (Target 이 죽음, Attacker 가 막타).</summary>
         Death = 2,
+    }
+
+    /// <summary>생산 대기열 하나 (건물별).</summary>
+    public struct ProductionQueue
+    {
+        public int BuildingId;
+
+        /// <summary>대기열 순서대로의 종류 (첫 번째가 생산 중).</summary>
+        public Combat.UnitKind[] Items;
+
+        /// <summary>첫 번째 항목 진행도 (0~1).</summary>
+        public float Progress;
+    }
+
+    /// <summary>
+    /// S→C 이 플레이어만의 경제 상태: 가진 자원과 내 건물들의 생산 대기열 (5Hz, unreliable — 다음 것이 덮어쓴다).
+    /// 남의 자원·대기열은 보내지 않는다.
+    /// </summary>
+    public struct PlayerStateMessage
+    {
+        public int Ore;
+        public List<ProductionQueue> Queues;
+
+        public void Write(PacketWriter w)
+        {
+            w.WriteByte((byte)MessageType.PlayerState);
+            w.WriteInt(Ore);
+            var queues = Queues ?? new List<ProductionQueue>();
+            var count = Math.Min(queues.Count, byte.MaxValue);
+            w.WriteByte((byte)count);
+            for (var i = 0; i < count; i++)
+            {
+                var q = queues[i];
+                w.WriteUShort((ushort)q.BuildingId);
+                var items = q.Items ?? Array.Empty<Combat.UnitKind>();
+                w.WriteByte((byte)Math.Min(items.Length, byte.MaxValue));
+                for (var k = 0; k < items.Length && k < byte.MaxValue; k++)
+                {
+                    w.WriteByte((byte)items[k]);
+                }
+
+                w.WriteByte((byte)Math.Round(Math.Max(0, Math.Min(1, q.Progress)) * 255));
+            }
+        }
+
+        public static PlayerStateMessage Read(ref PacketReader r)
+        {
+            var msg = new PlayerStateMessage { Ore = r.ReadInt(), Queues = new List<ProductionQueue>() };
+            int count = r.ReadByte();
+            for (var i = 0; i < count; i++)
+            {
+                var q = new ProductionQueue { BuildingId = r.ReadUShort() };
+                q.Items = new Combat.UnitKind[r.ReadByte()];
+                for (var k = 0; k < q.Items.Length; k++)
+                {
+                    q.Items[k] = (Combat.UnitKind)r.ReadByte();
+                }
+
+                q.Progress = r.ReadByte() / 255f;
+                msg.Queues.Add(q);
+            }
+
+            return msg;
+        }
     }
 
     public struct CombatEvent
@@ -235,6 +316,15 @@ namespace OpenRTS.Shared.Protocol
 
         /// <summary>공격 선딜 중 (멈춰서 휘두르는 중).</summary>
         WindingUp = 1,
+
+        /// <summary>일꾼이 자원을 들고 있음.</summary>
+        Carrying = 2,
+
+        /// <summary>건물이 아직 지어지는 중 (체력 비율 = 진행도).</summary>
+        UnderConstruction = 4,
+
+        /// <summary>건물이 생산 중.</summary>
+        Producing = 8,
     }
 
     /// <summary>클라이언트가 복원한 유닛 상태 한 개.</summary>

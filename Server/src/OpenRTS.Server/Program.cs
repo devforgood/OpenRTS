@@ -10,7 +10,7 @@ const string Usage = """
     사용법: OpenRTS.Server [옵션]
       --port <n>              UDP 포트 (기본 7777)
       --bots <n>              봇 수 (기본 3, 최대 600)
-      --scenario <name>       wander | converge | circleswap | crossing | pass | battle (기본 wander)
+      --scenario <name>       wander | converge | circleswap | crossing | pass | battle | skirmish (기본 wander)
       --map <name>            open | gate | blocks (기본 open)
       --player-units <n>      플레이어 한 명의 유닛 수 (기본 8, 최대 100)
       --radius <r>            유닛 반지름 (기본 0.5)

@@ -16,7 +16,7 @@ namespace OpenRTS.Client.Debugging
         public GameClient Client;
         public bool Visible = true;
 
-        private Rect _rect = new Rect(0, 10, 380, 0);
+        private Rect _rect = new Rect(0, 10, 420, 0);
         private SimSettings _draft;
         private bool _hasDraft;
         private bool _dirty;
@@ -86,7 +86,7 @@ namespace OpenRTS.Client.Debugging
             GUILayout.Space(4);
             GUILayout.Label("<b>Bots</b>", Rich());
             _draft.BotCount = (ushort)IntSlider("count", _draft.BotCount, 0, SimSettings.MaxBots);
-            _draft.Scenario = (BotScenario)GUILayout.Toolbar((int)_draft.Scenario, new[] { "Wander", "Conv", "Circle", "Cross", "Pass", "Battle" });
+            _draft.Scenario = (BotScenario)GUILayout.Toolbar((int)_draft.Scenario, new[] { "Wander", "Conv", "Circle", "Cross", "Pass", "Battle", "Skirm" });
 
             GUILayout.Space(4);
             GUILayout.Label("<b>Unit</b>", Rich());
@@ -108,6 +108,8 @@ namespace OpenRTS.Client.Debugging
             GUILayout.Space(4);
             GUILayout.Label("<b>Network</b>", Rich());
             _draft.DeltaSnapshots = GUILayout.Toggle(_draft.DeltaSnapshots, " delta snapshots (send changed units only)");
+            _draft.FogOfWar = GUILayout.Toggle(_draft.FogOfWar, " fog of war (don't send enemies outside team vision)");
+
 
             if (!_draft.Equals(before))
             {
@@ -166,6 +168,10 @@ namespace OpenRTS.Client.Debugging
             Preset("Battle 200", BotScenario.Battle, 200, MapKind.Open);
             Preset("Battle Gate", BotScenario.Battle, 200, MapKind.Gate);
             Preset("Battle Blocks", BotScenario.Battle, 200, MapKind.Blocks);
+            GUILayout.EndHorizontal();
+            GUILayout.BeginHorizontal();
+            Preset("Skirmish", BotScenario.Skirmish, 0, MapKind.Open);
+            Preset("Skirmish Blocks", BotScenario.Skirmish, 0, MapKind.Blocks);
             GUILayout.EndHorizontal();
 
 

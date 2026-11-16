@@ -70,11 +70,48 @@ public sealed class Unit
     /// <summary>사격 중지: 스스로 적을 찾거나 반격하지 않는다 (지정 공격 명령만 따른다).</summary>
     public bool HoldFire { get; set; }
 
+    // ── 건물·자원·경제 ─────────────────────────────────────
+
+    /// <summary>움직이지 않는 건물·자원. 발판이 길찾기·충돌에서 벽이 된다.</summary>
+    public bool IsStatic => Stats.IsStatic;
+
+    /// <summary>건물·자원의 발판 사각형.</summary>
+    public WallRect Footprint => new(Position - new Vector2(Stats.Footprint), Position + new Vector2(Stats.Footprint));
+
+    /// <summary>광맥에 남은 자원.</summary>
+    public int Ore { get; set; }
+
+    /// <summary>일꾼이 들고 있는 자원.</summary>
+    public int Carrying { get; set; }
+
+    /// <summary>건설 진행도 (0~1). 1 이면 완성.</summary>
+    public float BuildProgress { get; set; } = 1f;
+
+    public bool UnderConstruction => IsStatic && BuildProgress < 1f;
+
+    /// <summary>생산 대기열 (첫 항목이 생산 중).</summary>
+    public List<UnitKind> Queue { get; } = new();
+
+    /// <summary>대기열 첫 항목에 들인 시간(초).</summary>
+    public float QueueProgress { get; set; }
+
+    public int GatherFieldId { get; internal set; }
+    internal Vector2 GatherFieldPos { get; set; }
+    internal float WorkTimer { get; set; }
+    internal UnitKind BuildKind { get; set; }
+    internal Vector2 BuildSite { get; set; }
+    internal int BuildingId { get; set; }
+    internal bool BuildPaid { get; set; }
+    internal float PlaceWait { get; set; }
+
     /// <summary>행동 층 AI(<see cref="BattleAi"/>)가 조종하는 유닛.</summary>
 
     public bool HasBrain { get; init; }
 
     internal float ThinkTimer { get; set; }
+
+    /// <summary>전투 봇이 상대 진영까지 가 봤는지 (그 뒤로는 맵을 정찰).</summary>
+    internal bool Searched { get; set; }
     internal int IgnoreTargetId { get; set; }
     internal float IgnoreTimer { get; set; }
 
@@ -197,6 +234,13 @@ public sealed class World
     public const float SeparationStrength = 1f;
     public const int SeparationIterations = 2;
 
+    /// <summary>
+    /// 추적·공격 이동·막힘 재경로가 한 틱에 쓸 수 있는 A* 셀 확장 수. 다 쓰면 나머지는 다음 틱으로 미룬다
+    /// (직선으로 갈 수 있으면 A* 를 안 돌리므로 세지 않는다). 플레이어 명령은 제한하지 않는다.
+    /// 횟수가 아니라 확장 수로 세는 이유: 경로 하나의 비용이 수십~수천 칸으로 크게 달라서.
+    /// </summary>
+    public const int PathExpansionBudget = 12_000;
+
     /// <summary>대형 간격 = 지름 × 이 값.</summary>
     public const float FormationSpacing = 1.5f;
 
@@ -210,6 +254,9 @@ public sealed class World
     private readonly Dictionary<int, Unit> _byId = new();
     private readonly Dictionary<byte, byte> _players = new(); // 플레이어 → 팀
     private readonly List<int> _dead = new();
+
+    /// <summary>팀별 시야 (인덱스 = 팀, 1·2만 쓴다). 매 틱 끝에 다시 계산한다.</summary>
+    private readonly VisionGrid?[] _vision = { null, new VisionGrid(), new VisionGrid() };
     private readonly List<UnitState> _stateBuffer = new();
     private readonly List<Vector2> _positions = new();
     private readonly List<Vector2> _newVelocities = new();
@@ -225,8 +272,14 @@ public sealed class World
     private NavGrid _nav = null!;
     private IReadOnlyList<ObstacleVertex> _obstacles = Array.Empty<ObstacleVertex>();
     private float[]? _occupancy;
+    private IReadOnlyList<WallRect> _mapWalls = Array.Empty<WallRect>();
+    private bool _navDirty = true;
     private bool _occupancyFresh;
     private int _nextId = 1;
+    private int _pathExpansionsThisTick;
+
+    /// <summary>예산이 모자라 다음 틱으로 미룬 추적 경로 탐색 횟수 (누적, 확인용).</summary>
+    public int DeferredPaths { get; private set; }
 
     public World(int seed = 1234, SimSettings? settings = null)
     {
@@ -234,8 +287,12 @@ public sealed class World
         Settings = (settings ?? SimSettings.Default).Clamped();
         Combat = new CombatSystem(this);
         Ai = new BattleAi(this);
+        EconomySystem = new Economy.EconomySystem(this);
         BuildMap();
     }
+
+    /// <summary>자원·생산·건설.</summary>
+    public Economy.EconomySystem EconomySystem { get; }
 
     public CombatSystem Combat { get; }
 
@@ -266,7 +323,8 @@ public sealed class World
     public Unit Spawn(Vector2 position, bool isBot = false, byte owner = 0, byte team = UnitArchetypes.NeutralTeam, UnitKind kind = UnitKind.Melee, bool brain = false)
     {
         var id = AllocateId();
-        var unit = new Unit(id, Standable(position))
+        var isStatic = UnitArchetypes.Of(kind).IsStatic;
+        var unit = new Unit(id, isStatic ? ClampToMap(position) : Standable(position))
         {
             IsBot = isBot,
             Owner = owner,
@@ -277,13 +335,57 @@ public sealed class World
         };
         unit.Hp = unit.Stats.MaxHp;
         unit.LeashAnchor = unit.Position;
+        if (kind == UnitKind.OreField)
+        {
+            unit.Ore = EconomyRules.OrePerField;
+        }
+
         _units.Add(unit);
         _byId.Add(unit.Id, unit);
+        if (isStatic)
+        {
+            _navDirty = true;
+        }
+
         return unit;
     }
 
     /// <summary>플레이어의 팀 (없으면 0).</summary>
     public byte TeamOf(byte owner) => _players.GetValueOrDefault(owner);
+
+    /// <summary>
+    /// <paramref name="team"/> 이 <paramref name="unit"/> 을 볼 수 있는지 (전송 필터 기준).
+    /// 같은 팀·중립은 항상 보이고, 적은 팀 시야 칸 안에 있을 때만 보인다. Fog of War 를 끄면 모두 보인다.
+    /// </summary>
+    public bool CanSee(byte team, Unit unit)
+    {
+        if (!Settings.FogOfWar || unit.Team == team || unit.Team == UnitArchetypes.NeutralTeam)
+        {
+            return true;
+        }
+
+        return team < _vision.Length && _vision[team] is { } grid && grid.IsVisible(unit.Position);
+    }
+
+    /// <summary>위치 기준 시야 판정 (전투 이벤트 필터용). 같은 팀 위치인지는 호출하는 쪽이 따진다.</summary>
+    public bool CanSee(byte team, Vector2 position) =>
+        !Settings.FogOfWar || (team < _vision.Length && _vision[team] is { } grid && grid.IsVisible(position));
+
+    private void UpdateVision()
+    {
+        for (var t = 1; t < _vision.Length; t++)
+        {
+            _vision[t]!.Clear();
+        }
+
+        foreach (var u in _units)
+        {
+            if (u.Team > 0 && u.Team < _vision.Length && !u.IsDead)
+            {
+                _vision[u.Team]!.Reveal(u.Position, u.Stats.SightRange, _mapWalls);
+            }
+        }
+    }
 
     /// <summary>맵 중앙 근처 빈 곳에 유닛 하나를 만든다.</summary>
     public Unit SpawnRandom(bool isBot = false, byte owner = 0) => Spawn(FindFreeSpot(SimConstants.MapHalfSize * 0.5f), isBot, owner);
@@ -314,6 +416,11 @@ public sealed class World
         }
 
         _units.Remove(unit);
+        if (unit.IsStatic)
+        {
+            _navDirty = true;
+        }
+
         return true;
     }
 
@@ -351,14 +458,30 @@ public sealed class World
             }
         }
 
+        EnsureNavigation();
+        switch (command.Type)
+        {
+            case CommandType.Train:
+                return EconomySystem.Train(owner, group, command.Kind);
+
+            case CommandType.Build:
+                return EconomySystem.Build(owner, group, command.Kind, command.Target);
+        }
+
+        // 건물은 아래 명령(이동·공격·정지·채집)을 받지 않는다.
+        group.RemoveAll(u => u.IsStatic);
         foreach (var u in group)
         {
+            EconomySystem.CancelWork(u); // 짓기 전에 취소하면 비용을 돌려준다
             u.Windup = 0;
             u.AttackTargetId = 0;
         }
 
         switch (command.Type)
         {
+            case CommandType.Gather:
+                return EconomySystem.Gather(owner, group, Find(command.TargetUnit), command.Target);
+
             case CommandType.Stop:
                 foreach (var u in group)
                 {
@@ -371,6 +494,12 @@ public sealed class World
 
             case CommandType.Attack:
                 var victim = Find(command.TargetUnit);
+                if (victim == null || group.Count == 0 || !CanSee(group[0].Team, victim))
+
+                {
+                    return 0; // 보이지 않는 유닛은 지정할 수 없다 (안개 속 ID 를 아는 조작 클라이언트 방지)
+                }
+
                 foreach (var u in group)
                 {
                     if (Combat.IsValidTarget(u, victim))
@@ -441,6 +570,13 @@ public sealed class World
         Winner = 0;
         _restartTimer = 0;
         Combat.Reset();
+        EconomySystem.Reset();
+
+        if (Settings.Scenario == BotScenario.Skirmish)
+        {
+            RespawnPlayers(); // 플레이어마다 본진·일꾼·광맥
+            return;
+        }
 
         if (Settings.Scenario == BotScenario.Battle)
         {
@@ -472,12 +608,19 @@ public sealed class World
     public void Step(float dt, uint? tick = null)
     {
         CurrentTick = tick ?? CurrentTick + 1;
+        _pathExpansionsThisTick = 0;
         var s = Settings;
         _occupancyFresh = false;
+        EnsureNavigation();
+        var mark = System.Diagnostics.Stopwatch.GetTimestamp();
+        var profile = new StepProfile();
         UpdateBots(dt);
         Combat.BeginTick();
         Ai.Update(dt);
+        profile.Ai = Lap(ref mark);
         Combat.UpdateUnits(dt);
+        EconomySystem.Update(dt);
+        profile.Combat = Lap(ref mark);
         UpdateWaypoints();
 
         // 1. 선호 속도와 회피 속도
@@ -497,8 +640,10 @@ public sealed class World
         {
             var u = _units[i];
             var pref = PreferredVelocity(u, s.UnitSpeed, dt);
-            _newVelocities.Add(s.Avoidance ? Avoid(i, pref, dt) : pref);
+            _newVelocities.Add(u.IsStatic ? Vector2.Zero : s.Avoidance ? Avoid(i, pref, dt) : pref);
         }
+
+        profile.Avoidance = Lap(ref mark);
 
         // 2. 적용 (모든 유닛의 새 속도를 구한 뒤 한꺼번에 — ORCA 의 상호 가정)
         for (var i = 0; i < _units.Count; i++)
@@ -513,6 +658,11 @@ public sealed class World
             if (!float.IsFinite(v.X) || !float.IsFinite(v.Y))
             {
                 v = Vector2.Zero;
+            }
+
+            if (u.IsStatic)
+            {
+                continue; // 건물·자원은 움직이지 않는다
             }
 
             u.Velocity = v;
@@ -531,14 +681,20 @@ public sealed class World
         {
             foreach (var u in _units)
             {
-                u.Position = PushOutOfWalls(u.Position, s.UnitRadius);
+                if (!u.IsStatic)
+                {
+                    u.Position = PushOutOfWalls(u.Position, s.UnitRadius);
+                }
             }
         }
 
+        profile.Separation = Lap(ref mark);
         foreach (var u in _units)
         {
             UpdateArrival(u, dt);
         }
+
+        profile.Arrival = Lap(ref mark);
 
         Combat.UpdateProjectiles(dt);
         Combat.CollectDead(_dead);
@@ -548,7 +704,23 @@ public sealed class World
         }
 
         UpdateBattle(dt);
+        profile.Rest = Lap(ref mark);
+        UpdateVision();
+        profile.Vision = Lap(ref mark);
+        LastProfile = profile;
     }
+
+    /// <summary>마지막 Step 의 단계별 시간(ms). 서버 1틱이 튈 때 원인을 찾는 용도.</summary>
+    public StepProfile LastProfile { get; private set; }
+
+    private static float Lap(ref long mark)
+    {
+        var now = System.Diagnostics.Stopwatch.GetTimestamp();
+        var ms = (float)((now - mark) * 1000.0 / System.Diagnostics.Stopwatch.Frequency);
+        mark = now;
+        return ms;
+    }
+
 
     private void UpdateBattle(float dt)
     {
@@ -592,6 +764,10 @@ public sealed class World
         foreach (var unit in _units)
         {
             var target = unit.Windup > 0 ? unit.WindupTargetId : unit.AttackTargetId;
+            var flags = unit.Windup > 0 ? UnitFlags.WindingUp : UnitFlags.None;
+            if (unit.Carrying > 0) flags |= UnitFlags.Carrying;
+            if (unit.UnderConstruction) flags |= UnitFlags.UnderConstruction;
+            if (unit.Queue.Count > 0 && !unit.UnderConstruction) flags |= UnitFlags.Producing;
             _stateBuffer.Add(new UnitState
             {
                 Id = unit.Id,
@@ -599,9 +775,9 @@ public sealed class World
                 Owner = unit.Owner,
                 Team = unit.Team,
                 Kind = unit.Kind,
-                Health = unit.Hp / unit.Stats.MaxHp,
+                Health = unit.Kind == UnitKind.OreField ? unit.Ore / (float)EconomyRules.OrePerField : unit.Hp / unit.Stats.MaxHp,
                 AttackTarget = target,
-                Flags = unit.Windup > 0 ? UnitFlags.WindingUp : UnitFlags.None,
+                Flags = flags,
             });
         }
 
@@ -631,6 +807,11 @@ public sealed class World
                 moving++;
             }
 
+            if (_units[i].IsStatic)
+            {
+                continue; // 건물·자원은 겹침·벽 지표에서 뺀다 (발판 자체가 벽)
+            }
+
             if (_nav.HasWalls && _nav.WallDistance(_positions[i]) < r * 0.95f)
             {
                 wallHits++;
@@ -640,7 +821,7 @@ public sealed class World
             _grid.Query(_positions[i], combined, _query);
             foreach (var j in _query)
             {
-                if (j <= i)
+                if (j <= i || _units[j].IsStatic)
                 {
                     continue; // 쌍은 한 번만
                 }
@@ -675,7 +856,37 @@ public sealed class World
 
     private void BuildMap()
     {
-        var walls = MapLayouts.Create(Settings.Map);
+        _mapWalls = MapLayouts.Create(Settings.Map);
+        _navDirty = true;
+        EnsureNavigation();
+    }
+
+    /// <summary>맵 벽만 (시야 가림용 — 건물은 시야를 가리지 않는다).</summary>
+    public IReadOnlyList<WallRect> MapWalls => _mapWalls;
+
+    /// <summary>건물·자원이 생기거나 없어지면 다음 Step 전에 길찾기 격자와 ORCA 장애물을 다시 만든다.</summary>
+    internal void MarkNavigationDirty() => _navDirty = true;
+
+    /// <summary>
+    /// 길찾기 격자·장애물 = 맵 벽 + 건물·자원 발판. 건물이 바뀔 때만 다시 만든다 (200×200 격자, 수 ms).
+    /// </summary>
+    internal void EnsureNavigation()
+    {
+        if (!_navDirty)
+        {
+            return;
+        }
+
+        _navDirty = false;
+        var walls = new List<WallRect>(_mapWalls);
+        foreach (var u in _units)
+        {
+            if (u.IsStatic)
+            {
+                walls.Add(u.Footprint);
+            }
+        }
+
         _nav = new NavGrid(walls);
         var obstacles = new List<ObstacleVertex>();
         foreach (var w in walls)
@@ -685,7 +896,11 @@ public sealed class World
 
         _obstacles = obstacles;
         _occupancy = null;
+        NavigationRebuilds++;
     }
+
+    /// <summary>길찾기 격자를 다시 만든 횟수 (확인용).</summary>
+    public int NavigationRebuilds { get; private set; }
 
     private void RespawnPlayers()
     {
@@ -694,12 +909,19 @@ public sealed class World
             RemoveWhere(u => u.Owner == owner && !u.IsBot);
             SpawnSquad(owner, Settings.PlayerUnits);
         }
+
+        EnsureNavigation();
     }
 
     /// <summary>플레이어 유닛 무리. 근접·원거리를 번갈아 만든다. Battle 에서는 자기 팀 진영(1팀 왼쪽, 2팀 오른쪽)에 놓는다.</summary>
     private IReadOnlyList<Unit> SpawnSquad(byte owner, int count)
     {
         var team = TeamOf(owner);
+        if (Settings.Scenario == BotScenario.Skirmish)
+        {
+            return EconomySystem.SpawnBase(owner, team, BaseSlot(owner));
+        }
+
         var spacing = Radius * 2 * 1.5f;
         var center = Settings.Scenario == BotScenario.Battle
             ? Standable(new Vector2(team == 1 ? -38 : 38, (float)(_random.NextDouble() * 2 - 1) * 20))
@@ -717,16 +939,53 @@ public sealed class World
         return result;
     }
 
+    /// <summary>팀 안에서 몇 번째 플레이어인지 (본진 자리 정하기).</summary>
+    private int BaseSlot(byte owner)
+    {
+        var team = TeamOf(owner);
+        return _players.Where(p => p.Value == team).Select(p => p.Key).OrderBy(k => k).ToList().IndexOf(owner);
+    }
+
     private void RemoveWhere(Predicate<Unit> match)
     {
         for (var i = _units.Count - 1; i >= 0; i--)
         {
             if (match(_units[i]))
             {
+                if (_units[i].IsStatic)
+                {
+                    _navDirty = true;
+                }
+
                 _byId.Remove(_units[i].Id);
                 _units.RemoveAt(i);
             }
         }
+    }
+
+    /// <summary>
+    /// 예산 안에서 이동: 직선으로 갈 수 있으면 바로, 아니면 이번 틱 A* 확장 예산(<see cref="PathExpansionBudget"/>)이 남을 때만.
+    /// 예산은 경로 하나를 시작할 수 있는지만 본다 (시작한 탐색은 끝까지 한다).
+    /// </summary>
+    /// <returns>경로를 정했으면 true, 예산이 없어 미뤘으면 false.</returns>
+    internal bool TryMoveUnitBudgeted(Unit u, Vector2 target, bool repath = false)
+    {
+        var goal = Standable(ClampToMap(target));
+        if (!repath && (!_nav.HasWalls || _nav.HasLineOfSight(u.Position, goal, Radius)))
+        {
+            MoveUnit(u, goal);
+            return true;
+        }
+
+        if (_pathExpansionsThisTick >= PathExpansionBudget)
+        {
+            DeferredPaths++;
+            return false;
+        }
+
+        MoveUnit(u, goal, repath);
+        _pathExpansionsThisTick += _nav.LastExpansions;
+        return true;
     }
 
     internal void MoveUnit(Unit u, Vector2 target, bool repath = false)
@@ -784,7 +1043,7 @@ public sealed class World
             _grid.Query(_positions[i], combined, _query);
             foreach (var j in _query)
             {
-                if (j <= i)
+                if (j <= i || _units[i].IsStatic || _units[j].IsStatic)
                 {
                     continue;
                 }
@@ -922,7 +1181,7 @@ public sealed class World
         {
             // 공격하러 다가가는 대상은 피하지 않는다 — 피하면 시간 지평 때문에 다가갈수록 느려져
             // 사거리에 닿기까지 몇 초가 걸린다. 실제 겹침은 분리 보정이 막는다.
-            if (j != index && (self.AttackTargetId == 0 || _units[j].Id != self.AttackTargetId))
+            if (j != index && !_units[j].IsStatic && (self.AttackTargetId == 0 || _units[j].Id != self.AttackTargetId))
             {
                 _nearest.Add((Vector2.DistanceSquared(self.Position, _positions[j]), j));
             }
@@ -1001,10 +1260,14 @@ public sealed class World
         if (!near && Settings.RepathWhenBlocked && u.NoProgressTime >= RepathTime && u.RepathCount < MaxRepathsPerMove)
         {
             var count = u.RepathCount + 1;
-            MoveUnit(u, target, repath: true);
-            u.RepathCount = count;
-            Repaths++;
-            return;
+            if (TryMoveUnitBudgeted(u, target, repath: true))
+            {
+                u.RepathCount = count;
+                Repaths++;
+                return;
+            }
+
+            // 예산이 없으면 다음 틱에 다시 시도 (막힘 시간은 계속 쌓인다)
         }
 
         var limit = near ? BlockedTime : BlockedTimeFar;
@@ -1092,7 +1355,7 @@ public sealed class World
         return Standable(best);
     }
 
-    private Vector2 Standable(Vector2 p) => _nav.NearestStandable(ClampToMap(p), Radius);
+    internal Vector2 Standable(Vector2 p) => _nav.NearestStandable(ClampToMap(p), Radius);
 
     private Vector2 RandomPoint(float halfSize) => new(
         (float)(_random.NextDouble() * 2 - 1) * halfSize,
@@ -1102,4 +1365,33 @@ public sealed class World
         p,
         new Vector2(-SimConstants.MapHalfSize),
         new Vector2(SimConstants.MapHalfSize));
+}
+
+/// <summary>World.Step 단계별 시간 (ms).</summary>
+public struct StepProfile
+{
+    /// <summary>봇 왕복 + 전투 격자 + 행동 층 AI.</summary>
+    public float Ai;
+
+    /// <summary>전투 엔진 (추적 경로 탐색 포함).</summary>
+    public float Combat;
+
+    /// <summary>경유점 + 선호 속도 + ORCA.</summary>
+    public float Avoidance;
+
+    /// <summary>적분 + 분리 보정 + 벽 밀어내기.</summary>
+    public float Separation;
+
+    /// <summary>도착·막힘 판정 (재경로 A* 포함).</summary>
+    public float Arrival;
+
+    /// <summary>투사체 + 사망 처리 + 승패.</summary>
+    public float Rest;
+
+    public float Vision;
+
+    public float Total => Ai + Combat + Avoidance + Separation + Arrival + Rest + Vision;
+
+    public override string ToString() =>
+        $"ai {Ai:0.0} combat {Combat:0.0} avoid {Avoidance:0.0} sep {Separation:0.0} arrival {Arrival:0.0} rest {Rest:0.0} vision {Vision:0.0}";
 }

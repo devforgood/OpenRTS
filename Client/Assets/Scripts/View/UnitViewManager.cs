@@ -50,6 +50,10 @@ namespace OpenRTS.Client.View
             public Color Color;
             public float FlashUntil;
             public bool Windup;
+            public bool IsStatic;
+            public float Footprint;
+            public GameObject Carry;
+            public float AppliedHeight = -1f;
         }
 
         private readonly Dictionary<int, View> _views = new Dictionary<int, View>();
@@ -98,7 +102,10 @@ namespace OpenRTS.Client.View
                 _appliedRadius = radius;
                 foreach (var v in _views.Values)
                 {
-                    v.Root.localScale = Vector3.one * (2 * radius);
+                    if (!v.IsStatic)
+                    {
+                        v.Root.localScale = Vector3.one * (2 * radius);
+                    }
                 }
             }
 
@@ -117,8 +124,16 @@ namespace OpenRTS.Client.View
                 if (view == null)
                 {
                     view = CreateUnit(kv.Key, state);
-                    view.Root.localScale = Vector3.one * (2 * radius);
+                    view.Root.localScale = view.IsStatic ? Vector3.one : Vector3.one * (2 * radius);
                     _views.Add(kv.Key, view);
+                }
+
+                if (view.IsStatic)
+                {
+                    // 건물·자원: 바닥에 붙어 있고 돌지 않는다
+                    view.Root.position = ToWorld(kv.Value);
+                    UpdateLook(view, state, cameraRotation);
+                    continue;
                 }
 
                 // 위치·방향 (공격 대상이 있으면 그쪽을 본다)
@@ -167,6 +182,20 @@ namespace OpenRTS.Client.View
                 view.Ring.SetActive(Selection != null && Selection.Contains(state.Id));
             }
 
+            if (view.Carry != null)
+            {
+                var carrying = (state.Flags & UnitFlags.Carrying) != 0;
+                if (view.Carry.activeSelf != carrying)
+                {
+                    view.Carry.SetActive(carrying);
+                }
+            }
+
+            if (view.IsStatic)
+            {
+                UpdateStaticShape(view, state);
+            }
+
             if (view.HpBar != null)
             {
                 view.HpBar.rotation = cameraRotation; // 항상 화면을 향한다
@@ -177,8 +206,47 @@ namespace OpenRTS.Client.View
             }
         }
 
+        /// <summary>건설 중이면 체력 비율만큼 낮게, 광맥은 남은 양만큼 작게.</summary>
+        private static void UpdateStaticShape(View view, in UnitState state)
+        {
+            var size = view.Footprint * 2;
+            float height;
+            float width;
+            if (state.Kind == UnitKind.OreField)
+            {
+                var left = Mathf.Clamp01(state.Health);
+                width = size * Mathf.Lerp(0.45f, 1f, left);
+                height = Mathf.Lerp(0.3f, 1.1f, left);
+            }
+            else
+            {
+                var full = state.Kind == UnitKind.Headquarters ? 2.2f : 1.6f;
+                var building = (state.Flags & UnitFlags.UnderConstruction) != 0;
+                height = building ? Mathf.Lerp(0.15f, full, Mathf.Clamp01(state.Health)) : full;
+                width = size;
+            }
+
+            if (Mathf.Abs(height - view.AppliedHeight) < 0.01f)
+            {
+                return;
+            }
+
+            view.AppliedHeight = height;
+            view.Body.localScale = new Vector3(width, height, width);
+            view.Body.localPosition = new Vector3(0, height / 2, 0);
+            if (view.HpBar != null)
+            {
+                view.HpBar.localPosition = new Vector3(0, height + 0.5f, 0);
+            }
+        }
+
         private Color ColorFor(in UnitState s)
         {
+            if (s.Kind == UnitKind.OreField)
+            {
+                return OreColor;
+            }
+
             if (s.Owner != 0 && s.Owner == Client.PlayerId)
             {
                 return MineColor;
@@ -217,8 +285,83 @@ namespace OpenRTS.Client.View
             RemoveGhosts(Client.LatestRaw.ContainsKey);
         }
 
+        private static readonly Color OreColor = new Color(0.3f, 0.85f, 0.95f);
+
+        /// <summary>건물(정육면체, 발판 크기) · 광맥(45도 돌린 수정). 루트는 크기 1 이고 몸체를 직접 키운다.</summary>
+        private View CreateStatic(int id, in UnitState state)
+        {
+            var stats = UnitArchetypes.Of(state.Kind);
+            var mine = state.Owner != 0 && state.Owner == Client.PlayerId;
+            var root = new GameObject($"{state.Kind} {id}").transform;
+            root.SetParent(transform, false);
+            var body = CreatePrimitive(PrimitiveType.Cube, "Body", NeutralColor, false);
+            body.transform.SetParent(root, false);
+            if (state.Kind == UnitKind.OreField)
+            {
+                body.transform.localRotation = Quaternion.Euler(0, 45, 0);
+            }
+
+            // 문(생산 유닛이 나오는 쪽 표시) 대신 지붕 위 작은 깃발: 종류 구분용
+            var flag = CreatePrimitive(PrimitiveType.Cube, "Mark", NoseColor, false);
+            flag.transform.SetParent(body.transform, false);
+            flag.transform.localPosition = new Vector3(0, 0.55f, 0);
+            flag.transform.localScale = state.Kind == UnitKind.Headquarters ? new Vector3(0.5f, 0.1f, 0.5f) : new Vector3(0.25f, 0.1f, 0.6f);
+            flag.SetActive(state.Kind != UnitKind.OreField);
+
+            var view = new View
+            {
+                Root = root,
+                Body = body.transform,
+                BodyRenderer = body.GetComponent<Renderer>(),
+                NoseRenderer = flag.GetComponent<Renderer>(),
+                Owner = state.Owner,
+                Team = state.Team,
+                Kind = state.Kind,
+                Color = NeutralColor,
+                IsStatic = true,
+                Footprint = stats.Footprint,
+            };
+
+            if (mine)
+            {
+                var ring = CreatePrimitive(PrimitiveType.Cylinder, "Selection", new Color(0.4f, 1f, 0.5f), false);
+                ring.transform.SetParent(root, false);
+                ring.transform.localPosition = new Vector3(0, 0.02f, 0);
+                ring.transform.localScale = new Vector3(stats.Footprint * 3f, 0.01f, stats.Footprint * 3f);
+                ring.SetActive(false);
+                view.Ring = ring;
+            }
+
+            if (state.Team != UnitArchetypes.NeutralTeam)
+            {
+                AddHpBar(view, root, stats.Footprint * 2f);
+            }
+
+            return view;
+        }
+
+        private static void AddHpBar(View view, Transform root, float width)
+        {
+            var bar = new GameObject("HpBar").transform;
+            bar.SetParent(root, false);
+            bar.localPosition = new Vector3(0, 1.45f, 0);
+            bar.localScale = new Vector3(width, 0.14f * Mathf.Max(1f, width / 2.4f), 1f);
+            var back = CreatePrimitive(PrimitiveType.Quad, "Back", new Color(0.1f, 0.1f, 0.1f), false);
+            back.transform.SetParent(bar, false);
+            var fill = CreatePrimitive(PrimitiveType.Quad, "Fill", Color.green, false);
+            fill.transform.SetParent(bar, false);
+            view.HpBar = bar;
+            view.HpFill = fill.transform;
+            view.HpFillRenderer = fill.GetComponent<Renderer>();
+        }
+
         private View CreateUnit(int id, in UnitState state)
         {
+            if (UnitArchetypes.Of(state.Kind).IsStatic)
+            {
+                return CreateStatic(id, state);
+            }
+
             var mine = state.Owner != 0 && state.Owner == Client.PlayerId;
             var root = new GameObject(mine ? $"Unit {id} (mine)" : $"Unit {id} (team {state.Team})").transform;
             root.SetParent(transform, false);
@@ -233,6 +376,14 @@ namespace OpenRTS.Client.View
             {
                 nose.transform.localPosition = new Vector3(0, 0.45f, 0.6f);
                 nose.transform.localScale = new Vector3(0.12f, 0.12f, 0.8f);
+            }
+            else if (state.Kind == UnitKind.Worker)
+            {
+                // 일꾼: 작은 몸 + 짧은 도구. 자원을 들면 등 위에 작은 수정.
+                body.transform.localScale = new Vector3(0.8f, 0.75f, 0.8f);
+                body.transform.localPosition = new Vector3(0, -0.25f, 0);
+                nose.transform.localPosition = new Vector3(0, 0.2f, 0.55f);
+                nose.transform.localScale = new Vector3(0.15f, 0.15f, 0.4f);
             }
             else
             {
@@ -263,19 +414,20 @@ namespace OpenRTS.Client.View
                 view.Ring = ring;
             }
 
+            if (state.Kind == UnitKind.Worker)
+            {
+                var carry = CreatePrimitive(PrimitiveType.Cube, "Ore", OreColor, false);
+                carry.transform.SetParent(body.transform, false);
+                carry.transform.localPosition = new Vector3(0, 0.7f, -0.35f);
+                carry.transform.localScale = new Vector3(0.35f, 0.35f, 0.35f);
+                carry.transform.localRotation = Quaternion.Euler(0, 45, 0);
+                carry.SetActive(false);
+                view.Carry = carry;
+            }
+
             if (state.Team != UnitArchetypes.NeutralTeam)
             {
-                var bar = new GameObject("HpBar").transform;
-                bar.SetParent(root, false);
-                bar.localPosition = new Vector3(0, 1.45f, 0);
-                bar.localScale = new Vector3(1.2f, 0.14f, 1f);
-                var back = CreatePrimitive(PrimitiveType.Quad, "Back", new Color(0.1f, 0.1f, 0.1f), false);
-                back.transform.SetParent(bar, false);
-                var fill = CreatePrimitive(PrimitiveType.Quad, "Fill", Color.green, false);
-                fill.transform.SetParent(bar, false);
-                view.HpBar = bar;
-                view.HpFill = fill.transform;
-                view.HpFillRenderer = fill.GetComponent<Renderer>();
+                AddHpBar(view, root, 1.2f);
             }
 
             return view;

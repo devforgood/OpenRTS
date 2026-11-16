@@ -20,6 +20,9 @@ namespace OpenRTS.Client.Debugging
         public GameClient Client;
         public UnitViewManager Views;
         public CombatEffects Effects;
+        public FogOfWarView Fog;
+        private int _enemiesSeenAtStart = -1;
+        private int _maxFogVisibleCells;
 
         private ushort _bots = 60;
         private MapKind _map = MapKind.Open;
@@ -98,6 +101,22 @@ namespace OpenRTS.Client.Debugging
                 Debug.Log($"[AUTOTEST] battle started: {applied}, my team {Client.MyTeam}");
             }
 
+            // 시작 직후(두 팀이 60 떨어져 있음)에는 적이 시야 밖이므로 패킷으로 오지 않아야 한다.
+            if (_enemiesSeenAtStart < 0 && _elapsed - _battleStart > 1f)
+            {
+                _enemiesSeenAtStart = 0;
+                foreach (var u in Client.Latest.Values)
+                {
+                    if (Client.IsEnemy(u.Id))
+                    {
+                        _enemiesSeenAtStart++;
+                    }
+                }
+
+                Debug.Log($"[AUTOTEST] enemies received 1s after start: {_enemiesSeenAtStart} (fog {applied.FogOfWar})");
+            }
+
+            _maxFogVisibleCells = Math.Max(_maxFogVisibleCells, Fog != null ? Fog.VisibleCells : 0);
             _maxProjectiles = Math.Max(_maxProjectiles, Effects.ActiveProjectiles);
             _maxUnits = Math.Max(_maxUnits, Views.InterpolatedPositions.Count);
             _maxStepMs = Math.Max(_maxStepMs, stats.StepMs);
@@ -138,13 +157,16 @@ namespace OpenRTS.Client.Debugging
                 return;
             }
 
-            var ok = loserVisible == 0 && winnerVisible > 0 && Client.CombatEventsReceived > 0 && _maxProjectiles > 0 && _sawDamage;
+            var fogOk = !applied.FogOfWar || (_enemiesSeenAtStart == 0 && _maxFogVisibleCells > 0);
+            var ok = loserVisible == 0 && winnerVisible > 0 && Client.CombatEventsReceived > 0 && _maxProjectiles > 0 && _sawDamage && fogOk;
             Finish(ok,
                 $"{_map} battle {_bots} bots: team {stats.Winner} won after {_winnerSeen - _battleStart:0.0}s, " +
-                $"visible winner {winnerVisible} / loser {loserVisible}, deaths {stats.Deaths}, " +
+                $"visible winner {winnerVisible} / loser {loserVisible}, deaths {(stats.Deaths == SimStats.Unknown ? "?" : stats.Deaths.ToString())}, " +
                 $"combat events {Client.CombatEventsReceived}, max projectiles on screen {_maxProjectiles}, damage seen {_sawDamage}, " +
                 $"max units {_maxUnits}, max server step {_maxStepMs:0.00} ms, snapshots {Client.SnapshotsReceived} (delta {Client.DeltaSnapshotsReceived}), " +
-                $"no baseline {Client.SnapshotsMissingBaseline}, bandwidth {stats.SnapshotBytesPerSec / 1024f:0.0} KB/s, my team {Client.MyTeam}");
+                $"no baseline {Client.SnapshotsMissingBaseline}, bandwidth {stats.SnapshotBytesPerSec / 1024f:0.0} KB/s, my team {Client.MyTeam}, " +
+                $"fog {applied.FogOfWar} (enemies at start {_enemiesSeenAtStart}, max visible cells {_maxFogVisibleCells})");
+
         }
 
         private void Finish(bool ok, string detail)

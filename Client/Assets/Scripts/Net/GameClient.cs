@@ -71,6 +71,14 @@ namespace OpenRTS.Client.Net
 
         public int CombatEventsReceived { get; private set; }
 
+        /// <summary>내 자원 (서버가 5Hz 로 보냄).</summary>
+        public int Ore { get; private set; }
+
+        /// <summary>내 건물별 생산 대기열 (건물 ID → 대기열). 대기열이 빈 건물은 없다.</summary>
+        public Dictionary<int, ProductionQueue> Queues { get; } = new Dictionary<int, ProductionQueue>();
+
+        public bool HasPlayerState { get; private set; }
+
         /// <summary>최신 스냅샷 기준 내 유닛 ID (오름차순).</summary>
         public IReadOnlyList<int> MyUnits => _myUnits;
 
@@ -181,7 +189,11 @@ namespace OpenRTS.Client.Net
         /// 명령을 보낸다. 지금 추정한 서버 틱을 함께 실어 서버가 명령 지연을 잴 수 있게 한다.
         /// 255개가 넘으면 나눠 보낸다.
         /// </summary>
-        public void SendCommand(CommandType type, IReadOnlyList<int> unitIds, Vector2 target, int targetUnit)
+        public void SendCommand(CommandType type, IReadOnlyList<int> unitIds, Vector2 target, int targetUnit) =>
+            SendCommand(type, unitIds, target, targetUnit, OpenRTS.Shared.Combat.UnitKind.Melee);
+
+        /// <summary>Build·Train 처럼 종류가 필요한 명령.</summary>
+        public void SendCommand(CommandType type, IReadOnlyList<int> unitIds, Vector2 target, int targetUnit, OpenRTS.Shared.Combat.UnitKind kind)
         {
             if (State != ClientState.Joined || unitIds == null || unitIds.Count == 0)
             {
@@ -199,7 +211,7 @@ namespace OpenRTS.Client.Net
                 }
 
                 _writer.Reset();
-                new UnitCommand { Type = type, Target = target, TargetUnit = targetUnit, ClientTick = clientTick, UnitIds = chunk }.Write(_writer);
+                new UnitCommand { Type = type, Target = target, TargetUnit = targetUnit, ClientTick = clientTick, Kind = kind, UnitIds = chunk }.Write(_writer);
                 Send(_writer.ToArray(), DeliveryMethod.ReliableOrdered);
             }
         }
@@ -317,6 +329,18 @@ namespace OpenRTS.Client.Net
 
                     case MessageType.SimStats:
                         Stats = SimStats.Read(ref r);
+                        break;
+
+                    case MessageType.PlayerState:
+                        var ps = PlayerStateMessage.Read(ref r);
+                        Ore = ps.Ore;
+                        Queues.Clear();
+                        foreach (var q in ps.Queues)
+                        {
+                            Queues[q.BuildingId] = q;
+                        }
+
+                        HasPlayerState = true;
                         break;
 
                     case MessageType.CombatEvents:

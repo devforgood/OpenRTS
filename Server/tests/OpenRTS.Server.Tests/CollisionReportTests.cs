@@ -111,13 +111,18 @@ public class CollisionReportTests
             var worst = 1f;
             var wallHits = 0;
             var maxStep = 0.0;
+            var worstProfile = new StepProfile();
             var total = System.Diagnostics.Stopwatch.StartNew();
             var ticks = 0;
             while (world.Winner == 0 && ticks < 30 * 300)
             {
                 var sw = System.Diagnostics.Stopwatch.StartNew();
                 world.Step(SimConstants.TickDelta);
-                maxStep = Math.Max(maxStep, sw.Elapsed.TotalMilliseconds);
+                if (sw.Elapsed.TotalMilliseconds > maxStep)
+                {
+                    maxStep = sw.Elapsed.TotalMilliseconds;
+                    worstProfile = world.LastProfile;
+                }
                 ticks++;
                 if (ticks % 5 == 0)
                 {
@@ -129,6 +134,7 @@ public class CollisionReportTests
 
             var survivors = world.Units.Count(u => u.Team == world.Winner);
             _output.WriteLine($"{map,-7} {bots,4}  {world.Winner,6}  {ticks * SimConstants.TickDelta,7:0.0}  {survivors,9}  {world.Combat.Deaths,6}  {worst,8:0.000}  {wallHits,8}  {total.Elapsed.TotalMilliseconds / ticks,9:0.00}  {maxStep,9:0.00}");
+            _output.WriteLine($"        worst tick: {worstProfile}, deferred paths {world.DeferredPaths}");
             Assert.NotEqual(0, world.Winner);
         }
     }
@@ -151,7 +157,10 @@ public class CollisionReportTests
         var gate = Make(BotScenario.Pass, 50);
         gate.Map = MapKind.Gate;
         cases.Add(("gate pass 50", gate));
-        cases.Add(("battle 200", Make(BotScenario.Battle, 200)));
+        var noFog = Make(BotScenario.Battle, 200);
+        noFog.FogOfWar = false;
+        cases.Add(("battle 200 nofog", noFog));
+        cases.Add(("battle 200 fog", Make(BotScenario.Battle, 200))); // 1팀이 받는 양
 
         _output.WriteLine($"{Seconds}s each, {SimConstants.SnapshotRate}Hz snapshots, delta baseline = {AckLagSnapshots} snapshots ago");
         _output.WriteLine("case             units  full B/s   delta B/s  ratio");
@@ -179,7 +188,9 @@ public class CollisionReportTests
                     continue;
                 }
 
-                var current = world.CaptureState().Select(u => SnapshotEntry.From(u)).OrderBy(e => e.Id).ToList();
+                var current = world.CaptureState()
+                    .Where(u => world.Find(u.Id) is { } unit && world.CanSee(1, unit))
+                    .Select(u => SnapshotEntry.From(u)).OrderBy(e => e.Id).ToList();
                 fullBytes += Bytes(current);
                 if (history.Count >= AckLagSnapshots)
                 {

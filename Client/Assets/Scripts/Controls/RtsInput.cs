@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using OpenRTS.Client.Net;
 using OpenRTS.Client.View;
+using OpenRTS.Shared.Combat;
 using OpenRTS.Shared.Protocol;
 using UnityEngine;
 using Vector2 = System.Numerics.Vector2;
@@ -14,6 +15,7 @@ namespace OpenRTS.Client.Controls
     /// <item>우클릭: 땅이면 이동(가는 동안 적 무시, 서버가 대형을 짠다), 적 유닛이면 그 유닛 공격</item>
     /// <item>Ctrl+우클릭: 공격 이동 (가면서 만나는 적과 싸움) / H: 정지</item>
     /// <item>Ctrl+1~9: 부대 지정, 1~9: 부대 선택</item>
+    /// <item>우클릭 광맥: 일꾼 채집 / B: 병영 배치(좌클릭으로 놓기, Shift 로 여러 개) / Z·X: 선택한 건물에서 생산</item>
     /// <item>WASD/화살표: 카메라 이동, 휠: 줌</item>
     /// </list>
     /// </summary>
@@ -54,17 +56,33 @@ namespace OpenRTS.Client.Controls
                 _autoSelected = true;
             }
 
-            HandleSelection();
-            HandleGroups();
+            if (Placing.HasValue)
+            {
+                UpdatePlacement();
+            }
+            else
+            {
+                HandleSelection();
+            }
 
-            if (UnityEngine.Input.GetMouseButtonDown(1) && TryGetGroundPoint(UnityEngine.Input.mousePosition, out var point) && Selection.Count > 0)
+            HandleGroups();
+            HandleProductionKeys();
+
+            if (!Placing.HasValue && UnityEngine.Input.GetMouseButtonDown(1) && TryGetGroundPoint(UnityEngine.Input.mousePosition, out var point) && Selection.Count > 0)
             {
                 var ground = new Vector2(point.x, point.z);
                 var enemy = PickUnit(UnityEngine.Input.mousePosition, Client.IsEnemy);
+                var work = enemy < 0 ? PickUnit(UnityEngine.Input.mousePosition, IsWorkTarget) : -1;
                 if (enemy >= 0)
                 {
                     Client.SendCommand(CommandType.Attack, Selection.Ids, ground, enemy);
                     ShowMarker(UnitViewManager.ToWorld(Views.InterpolatedPositions[enemy]), AttackMarkerColor);
+                }
+                else if (work >= 0)
+                {
+                    // 광맥·짓다 만 내 건물: 일꾼은 캐거나 이어 짓고, 다른 유닛은 그 자리로 이동 (서버가 나눔)
+                    Client.SendCommand(CommandType.Gather, Selection.Ids, ground, work);
+                    ShowMarker(UnitViewManager.ToWorld(Views.InterpolatedPositions[work]), WorkMarkerColor);
                 }
                 else if (Ctrl())
                 {
@@ -174,7 +192,7 @@ namespace OpenRTS.Client.Controls
         {
             var best = -1;
             var bestDist = float.MaxValue;
-            var radius = Client.Settings?.UnitRadius ?? 0.5f;
+            var unitRadius = Client.Settings?.UnitRadius ?? 0.5f;
             foreach (var kv in Views.InterpolatedPositions)
             {
                 if (!match(kv.Key))
@@ -182,6 +200,10 @@ namespace OpenRTS.Client.Controls
                     continue;
                 }
 
+                // 건물·광맥은 발판 크기로 집는다
+                var radius = Client.Latest.TryGetValue(kv.Key, out var s) && UnitArchetypes.Of(s.Kind).IsStatic
+                    ? UnitArchetypes.Of(s.Kind).Footprint
+                    : unitRadius;
                 var center = Camera.WorldToScreenPoint(UnitViewManager.ToWorld(kv.Value, radius));
                 var edge = Camera.WorldToScreenPoint(UnitViewManager.ToWorld(kv.Value + new Vector2(radius, 0), radius));
                 var pickRadius = Mathf.Max(12f, Vector3.Distance(center, edge) * 1.5f);
@@ -202,9 +224,9 @@ namespace OpenRTS.Client.Controls
             var radius = Client.Settings?.UnitRadius ?? 0.5f;
             foreach (var kv in Views.InterpolatedPositions)
             {
-                if (!Client.IsMine(kv.Key))
+                if (!Client.IsMine(kv.Key) || IsStatic(kv.Key))
                 {
-                    continue;
+                    continue; // 박스 선택은 움직이는 유닛만 (건물은 클릭으로)
                 }
 
                 var p = Camera.WorldToScreenPoint(UnitViewManager.ToWorld(kv.Value, radius));
@@ -260,7 +282,164 @@ namespace OpenRTS.Client.Controls
         private static bool IsOverDebugWindow(Vector3 mouse)
         {
             var gui = new UnityEngine.Vector2(mouse.x, Screen.height - mouse.y);
-            return Debugging.NetDebugHud.Area.Contains(gui) || Debugging.SimSettingsPanel.Area.Contains(gui);
+            return Debugging.NetDebugHud.Area.Contains(gui) || Debugging.SimSettingsPanel.Area.Contains(gui) || CommandPanel.Area.Contains(gui);
+        }
+
+        // ── 경제: 건설 배치·생산 ──────────────────────────────
+
+        private static readonly Color WorkMarkerColor = new Color(0.3f, 0.85f, 0.95f);
+
+        /// <summary>건설 배치 중인 건물 종류 (없으면 null). 좌클릭으로 놓고, 우클릭·Esc 로 취소.</summary>
+        public UnitKind? Placing { get; private set; }
+
+        private Transform _placementGhost;
+        private Renderer _placementRenderer;
+
+        private bool IsStatic(int id) => Client.Latest.TryGetValue(id, out var s) && UnitArchetypes.Of(s.Kind).IsStatic;
+
+        private bool IsWorkTarget(int id) =>
+            Client.Latest.TryGetValue(id, out var s) &&
+            (s.Kind == UnitKind.OreField || (s.Owner == Client.PlayerId && (s.Flags & UnitFlags.UnderConstruction) != 0));
+
+        /// <summary>선택한 유닛 중 일꾼 수 / 건물(종류별) — 명령 패널이 버튼을 고를 때 쓴다.</summary>
+        public int SelectedCount(UnitKind kind)
+        {
+            var n = 0;
+            foreach (var id in Selection.Ids)
+            {
+                if (Client.Latest.TryGetValue(id, out var s) && s.Kind == kind && (s.Flags & UnitFlags.UnderConstruction) == 0)
+                {
+                    n++;
+                }
+            }
+
+            return n;
+        }
+
+        public void BeginPlacement(UnitKind kind)
+        {
+            if (SelectedCount(UnitKind.Worker) == 0 || !UnitArchetypes.CanBuild(kind))
+            {
+                return;
+            }
+
+            Placing = kind;
+            if (_placementGhost == null)
+            {
+                var go = GameObject.CreatePrimitive(PrimitiveType.Cube);
+                go.name = "Placement";
+                Destroy(go.GetComponent<Collider>());
+                _placementGhost = go.transform;
+                _placementRenderer = go.GetComponent<Renderer>();
+            }
+
+            var size = UnitArchetypes.Of(kind).Footprint * 2;
+            _placementGhost.localScale = new Vector3(size, 0.3f, size);
+            _placementGhost.gameObject.SetActive(true);
+        }
+
+        public void CancelPlacement()
+        {
+            Placing = null;
+            if (_placementGhost != null)
+            {
+                _placementGhost.gameObject.SetActive(false);
+            }
+        }
+
+        /// <summary>생산: 고른 건물 중 그 종류를 만들 수 있는 것에 하나 넣는다 (서버가 대기열이 짧은 곳을 고름).</summary>
+        public void Train(UnitKind kind)
+        {
+            Client.SendCommand(CommandType.Train, Selection.Ids, default, 0, kind);
+        }
+
+        private void HandleProductionKeys()
+        {
+            if (UnityEngine.Input.GetKeyDown(KeyCode.B))
+            {
+                BeginPlacement(UnitKind.Barracks);
+            }
+
+            if (UnityEngine.Input.GetKeyDown(KeyCode.Z))
+            {
+                Train(SelectedCount(UnitKind.Barracks) > 0 ? UnitKind.Melee : UnitKind.Worker);
+            }
+
+            if (UnityEngine.Input.GetKeyDown(KeyCode.X) && SelectedCount(UnitKind.Barracks) > 0)
+            {
+                Train(UnitKind.Ranged);
+            }
+        }
+
+        private void UpdatePlacement()
+        {
+            var kind = Placing!.Value;
+            if (UnityEngine.Input.GetKeyDown(KeyCode.Escape) || UnityEngine.Input.GetMouseButtonDown(1) || SelectedCount(UnitKind.Worker) == 0)
+            {
+                CancelPlacement();
+                return;
+            }
+
+            if (!TryGetGroundPoint(UnityEngine.Input.mousePosition, out var point))
+            {
+                return;
+            }
+
+            // 0.5 칸에 맞춘다
+            var site = new Vector2(Mathf.Round(point.x * 2) / 2, Mathf.Round(point.z * 2) / 2);
+            var ok = LooksBuildable(kind, site);
+            _placementGhost.position = UnitViewManager.ToWorld(site, 0.15f);
+            _placementRenderer.material.color = ok ? new Color(0.3f, 0.9f, 0.4f) : new Color(0.9f, 0.3f, 0.25f);
+
+            if (UnityEngine.Input.GetMouseButtonDown(0) && !IsOverDebugWindow(UnityEngine.Input.mousePosition))
+            {
+                if (ok && Client.Ore >= UnitArchetypes.Of(kind).Cost)
+                {
+                    Client.SendCommand(CommandType.Build, Selection.Ids, site, 0, kind);
+                    ShowMarker(UnitViewManager.ToWorld(site), WorkMarkerColor);
+                }
+
+                if (!(UnityEngine.Input.GetKey(KeyCode.LeftShift) || UnityEngine.Input.GetKey(KeyCode.RightShift)))
+                {
+                    CancelPlacement(); // Shift 를 누르고 있으면 계속 놓는다
+                }
+            }
+        }
+
+        /// <summary>
+        /// 클라이언트가 아는 정보로 대충 판단 (맵 안, 맵 벽·보이는 건물·광맥과 안 겹침). 최종 판정은 서버가 한다.
+        /// </summary>
+        private bool LooksBuildable(UnitKind kind, Vector2 site)
+        {
+            var half = UnitArchetypes.Of(kind).Footprint;
+            var gap = (Client.Settings?.UnitRadius ?? 0.5f) * 2;
+            var h = OpenRTS.Shared.SimConstants.MapHalfSize - 1f;
+            if (Mathf.Abs(site.X) + half > h || Mathf.Abs(site.Y) + half > h)
+            {
+                return false;
+            }
+
+            foreach (var wall in OpenRTS.Shared.Map.MapLayouts.Create(Client.Settings?.Map ?? OpenRTS.Shared.Map.MapKind.Open))
+            {
+                if (site.X + half > wall.Min.X - gap && site.X - half < wall.Max.X + gap && site.Y + half > wall.Min.Y - gap && site.Y - half < wall.Max.Y + gap)
+                {
+                    return false;
+                }
+            }
+
+            foreach (var kv in Views.InterpolatedPositions)
+            {
+                if (Client.Latest.TryGetValue(kv.Key, out var s) && UnitArchetypes.Of(s.Kind).IsStatic)
+                {
+                    var other = UnitArchetypes.Of(s.Kind).Footprint;
+                    if (Mathf.Abs(site.X - kv.Value.X) < half + other + gap && Mathf.Abs(site.Y - kv.Value.Y) < half + other + gap)
+                    {
+                        return false;
+                    }
+                }
+            }
+
+            return true;
         }
 
 

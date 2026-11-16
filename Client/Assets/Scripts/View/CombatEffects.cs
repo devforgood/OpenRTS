@@ -23,6 +23,7 @@ namespace OpenRTS.Client.View
 
         public GameClient Client;
         public UnitViewManager Views;
+        public GhostView Ghosts;
 
         private struct Flight
         {
@@ -90,6 +91,7 @@ namespace OpenRTS.Client.View
                     break;
 
                 case CombatEventType.Death:
+                    Ghosts?.NotifyDeath(e.Target);
                     if (positions.TryGetValue(e.Target, out var at))
                     {
                         AddMark(at);

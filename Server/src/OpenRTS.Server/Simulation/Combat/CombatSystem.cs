@@ -1,5 +1,6 @@
 using System.Numerics;
 using OpenRTS.Shared.Combat;
+using OpenRTS.Shared.Map;
 using OpenRTS.Shared.Protocol;
 
 namespace OpenRTS.Server.Simulation.Combat;
@@ -18,6 +19,12 @@ public enum UnitOrder : byte
 
     /// <summary>지정한 적을 쫓아가 공격한다. 대상이 죽으면 Idle.</summary>
     Attack,
+
+    /// <summary>일꾼: 광맥과 본진을 오가며 자원을 나른다 (경제 시스템이 실행, 적은 무시).</summary>
+    Gather,
+
+    /// <summary>일꾼: 건물을 짓는다 (경제 시스템이 실행, 적은 무시).</summary>
+    Build,
 }
 
 /// <summary>
@@ -51,6 +58,9 @@ public sealed class CombatSystem
     /// <summary>적 탐색 격자 셀 크기 (획득 거리 정도).</summary>
     private const float GridCell = 10f;
 
+    /// <summary>가장 큰 건물 발판 반폭의 대각선 (격자 탐색 여유).</summary>
+    private const float MaxFootprint = 3f;
+
     private readonly World _world;
     private readonly SpatialGrid _grid = new();
     private readonly List<Vector2> _positions = new();
@@ -58,6 +68,7 @@ public sealed class CombatSystem
     private readonly List<int> _query = new();
     private readonly List<Projectile> _projectiles = new();
     private readonly List<CombatEvent> _events = new();
+    private readonly List<(Vector2 Attacker, Vector2 Target)> _eventPositions = new();
 
     private struct Projectile
     {
@@ -82,12 +93,19 @@ public sealed class CombatSystem
     /// <summary>쌓인 전투 이벤트. 서버가 스냅샷과 함께 보내고 <see cref="ClearEvents"/> 한다.</summary>
     public IReadOnlyList<CombatEvent> Events => _events;
 
-    public void ClearEvents() => _events.Clear();
+    /// <summary><see cref="Events"/> 와 같은 순서의, 이벤트 순간 공격자·대상 위치 (시야 필터용).</summary>
+    public IReadOnlyList<(Vector2 Attacker, Vector2 Target)> EventPositions => _eventPositions;
+
+    public void ClearEvents()
+    {
+        _events.Clear();
+        _eventPositions.Clear();
+    }
 
     public void Reset()
     {
         _projectiles.Clear();
-        _events.Clear();
+        ClearEvents();
         Deaths = 0;
     }
 
@@ -110,8 +128,23 @@ public sealed class CombatSystem
         _grid.Build(_positions, GridCell);
     }
 
-    /// <summary>두 유닛 가장자리 사이 거리.</summary>
-    public float EdgeDistance(Unit a, Unit b) => Vector2.Distance(a.Position, b.Position) - 2 * Radius;
+    /// <summary>
+    /// 두 유닛 가장자리 사이 거리. 건물·자원은 발판 사각형까지의 거리로 잰다.
+    /// </summary>
+    public float EdgeDistance(Unit a, Unit b)
+    {
+        if (b.IsStatic)
+        {
+            return Vector2.Distance(a.Position, b.Footprint.ClosestPoint(a.Position)) - (a.IsStatic ? 0 : Radius);
+        }
+
+        if (a.IsStatic)
+        {
+            return Vector2.Distance(b.Position, a.Footprint.ClosestPoint(b.Position)) - Radius;
+        }
+
+        return Vector2.Distance(a.Position, b.Position) - 2 * Radius;
+    }
 
     public bool IsValidTarget(Unit self, Unit? target) =>
         target is { IsDead: false } && UnitArchetypes.AreEnemies(self.Team, target.Team);
@@ -131,7 +164,7 @@ public sealed class CombatSystem
         }
 
         _query.Clear();
-        _grid.Query(self.Position, range + 2 * Radius, _query);
+        _grid.Query(self.Position, range + 2 * Radius + MaxFootprint, _query);
         foreach (var i in _query)
         {
             var other = _indexed[i];
@@ -146,8 +179,9 @@ public sealed class CombatSystem
                 continue;
             }
 
+            // 우선순위: 내 편을 공격 중인 적 → 공격할 수 있는 유닛 → 건물
             var victim = other.AttackTargetId != 0 ? _world.Find(other.AttackTargetId) : null;
-            var priority = victim != null && victim.Team == self.Team ? 0 : 1;
+            var priority = victim != null && victim.Team == self.Team ? 0 : other.Stats.CanAttack ? 1 : 2;
             if (priority < bestPriority || (priority == bestPriority && dist < bestDist))
             {
                 best = other;
@@ -164,9 +198,9 @@ public sealed class CombatSystem
     {
         foreach (var u in _world.Units)
         {
-            if (u.Team == UnitArchetypes.NeutralTeam || u.IsDead)
+            if (u.Team == UnitArchetypes.NeutralTeam || u.IsDead || !u.Stats.CanAttack)
             {
-                continue;
+                continue; // 중립·건물은 싸우지 않는다
             }
 
             u.Cooldown = MathF.Max(0, u.Cooldown - dt);
@@ -187,6 +221,10 @@ public sealed class CombatSystem
 
             switch (u.Order)
             {
+                case UnitOrder.Gather:
+                case UnitOrder.Build:
+                    continue; // 일하는 중에는 적을 무시 (경제 시스템이 움직임을 맡는다)
+
                 case UnitOrder.Move:
                     if (!u.IsMoving)
                     {
@@ -217,9 +255,8 @@ public sealed class CombatSystem
 
                         var headingToGoal = u.Target is { } t && Vector2.DistanceSquared(t, u.Goal) < 1f;
                         u.ChaseTimer -= dt;
-                        if ((!u.IsMoving || !headingToGoal) && u.ChaseTimer <= 0)
+                        if ((!u.IsMoving || !headingToGoal) && u.ChaseTimer <= 0 && _world.TryMoveUnitBudgeted(u, u.Goal))
                         {
-                            _world.MoveUnit(u, u.Goal);
                             u.ChaseTimer = 1f; // 막혀 멈췄을 때 매 틱 다시 찾지 않게
                         }
 
@@ -313,9 +350,9 @@ public sealed class CombatSystem
 
         // 추적: 대상이 충분히 움직였거나 멈춰 버렸을 때만 경로를 다시 찾는다.
         u.ChaseTimer -= dt;
-        if (u.ChaseTimer <= 0 && (!u.IsMoving || Vector2.Distance(u.ChasePoint, target.Position) > ChaseRepathDistance))
+        if (u.ChaseTimer <= 0 && (!u.IsMoving || Vector2.Distance(u.ChasePoint, target.Position) > ChaseRepathDistance)
+            && _world.TryMoveUnitBudgeted(u, target.Position))
         {
-            _world.MoveUnit(u, target.Position);
             u.ChasePoint = target.Position;
             u.ChaseTimer = ChaseRepathInterval;
         }
@@ -371,10 +408,11 @@ public sealed class CombatSystem
                 continue;
             }
 
-            var to = target.Position - p.Position;
+            var aim = target.IsStatic ? target.Footprint.ClosestPoint(p.Position) : target.Position;
+            var to = aim - p.Position;
             var dist = to.Length();
             var step = p.Speed * dt;
-            if (dist <= step + Radius)
+            if (dist <= step + (target.IsStatic ? 0.05f : Radius))
             {
                 _projectiles.RemoveAt(i);
                 ApplyDamage(p.AttackerId, p.Team, target, p.Damage);
@@ -417,7 +455,7 @@ public sealed class CombatSystem
         foreach (var i in _query)
         {
             var ally = _indexed[i];
-            if (ally.IsDead || ally.HoldFire || ally.Team != victim.Team || ally.AttackTargetId != 0 || ally.Windup > 0)
+            if (ally.IsDead || ally.HoldFire || !ally.Stats.CanAttack || ally.Team != victim.Team || ally.AttackTargetId != 0 || ally.Windup > 0)
 
             {
                 continue;
@@ -455,6 +493,13 @@ public sealed class CombatSystem
         }
     }
 
-    private void Emit(CombatEventType type, int attacker, int target) =>
+    private void Emit(CombatEventType type, int attacker, int target)
+    {
         _events.Add(new CombatEvent { Tick = _world.CurrentTick, Type = type, Attacker = attacker, Target = target });
+        var a = _world.Find(attacker);
+        var t = _world.Find(target);
+        var tp = t?.Position ?? a?.Position ?? Vector2.Zero;
+        _eventPositions.Add((a?.Position ?? tp, tp));
+    }
+
 }

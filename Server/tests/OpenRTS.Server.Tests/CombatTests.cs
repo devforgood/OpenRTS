@@ -121,9 +121,16 @@ public class CombatTests
     public void AttackCommand_ChasesAroundWall_AndKills()
     {
         var world = Create(MapKind.Gate);
-        var u = world.Spawn(new Vector2(-6, 20), team: 1, owner: 1, kind: UnitKind.Melee);
-        var target = Dummy(world, new Vector2(6, 20));
-        world.Command(1, new UnitCommand { Type = CommandType.Attack, TargetUnit = target.Id, UnitIds = new[] { u.Id } });
+        var u = world.Spawn(new Vector2(-4, 20), team: 1, owner: 1, kind: UnitKind.Melee);
+        var target = Dummy(world, new Vector2(4, 20)); // 벽 너머 — 벽이 시야를 가린다
+        world.Step(SimConstants.TickDelta);
+        Assert.Equal(0, world.Command(1, new UnitCommand { Type = CommandType.Attack, TargetUnit = target.Id, UnitIds = new[] { u.Id } }));
+
+        var spotter = world.Spawn(new Vector2(8, 26), team: 1); // 벽 건너편 아군이 보여 준다 (팀 시야 공유)
+        spotter.HoldFire = true;
+        world.Step(SimConstants.TickDelta);
+        Assert.Equal(1, world.Command(1, new UnitCommand { Type = CommandType.Attack, TargetUnit = target.Id, UnitIds = new[] { u.Id } }));
+
 
         RunUntil(world, () => world.Find(target.Id) is null, 30f);
         Assert.True(u.Position.X > 0, "should have gone through the gap");

@@ -27,6 +27,12 @@ namespace OpenRTS.Shared.Protocol
         /// 한 팀이 전멸하면 몇 초 뒤 다시 시작한다. 플레이어는 들어온 순서대로 1팀·2팀에 나뉘어 함께 싸운다.
         /// </summary>
         Battle = 5,
+
+        /// <summary>
+        /// 경제: 플레이어마다 본진·일꾼 4·광맥 8 을 자기 팀 진영에 주고 시작한다. 봇은 없다.
+        /// 일꾼 생산 → 채집 → 병영 건설 → 병력 생산.
+        /// </summary>
+        Skirmish = 6,
     }
 
     /// <summary>
@@ -76,6 +82,11 @@ namespace OpenRTS.Shared.Protocol
         /// <summary>클라이언트가 확인한 스냅샷 대비 바뀐 유닛만 보낸다 (끄면 매번 전체 스냅샷, 대역폭 비교용).</summary>
         public bool DeltaSnapshots;
 
+        /// <summary>
+        /// 팀 시야 밖의 적 유닛을 보내지 않는다 (Fog of War). 끄면 모두에게 모든 유닛을 보낸다 (충돌 확인용).
+        /// </summary>
+        public bool FogOfWar;
+
         public static SimSettings Default => new SimSettings
         {
             BotCount = 3,
@@ -92,6 +103,7 @@ namespace OpenRTS.Shared.Protocol
             Separation = true,
             RepathWhenBlocked = true,
             DeltaSnapshots = true,
+            FogOfWar = true,
         };
 
         /// <summary>허용 범위로 자른 값. 서버는 받은 값을 반드시 이걸 거쳐 적용한다.</summary>
@@ -136,6 +148,7 @@ namespace OpenRTS.Shared.Protocol
             w.WriteByte(Separation ? (byte)1 : (byte)0);
             w.WriteByte(RepathWhenBlocked ? (byte)1 : (byte)0);
             w.WriteByte(DeltaSnapshots ? (byte)1 : (byte)0);
+            w.WriteByte(FogOfWar ? (byte)1 : (byte)0);
         }
 
         /// <summary>메시지 타입 바이트를 읽은 뒤 호출한다.</summary>
@@ -155,13 +168,14 @@ namespace OpenRTS.Shared.Protocol
             Separation = r.ReadByte() != 0,
             RepathWhenBlocked = r.ReadByte() != 0,
             DeltaSnapshots = r.ReadByte() != 0,
+            FogOfWar = r.ReadByte() != 0,
         };
 
         public bool Equals(SimSettings o) =>
             BotCount == o.BotCount && Scenario == o.Scenario && Map == o.Map && PlayerUnits == o.PlayerUnits && UnitRadius.Equals(o.UnitRadius) &&
             UnitSpeed.Equals(o.UnitSpeed) && Avoidance == o.Avoidance && NeighborDist.Equals(o.NeighborDist) &&
             MaxNeighbors == o.MaxNeighbors && TimeHorizon.Equals(o.TimeHorizon) && StopWhenBlocked == o.StopWhenBlocked &&
-            Separation == o.Separation && RepathWhenBlocked == o.RepathWhenBlocked && DeltaSnapshots == o.DeltaSnapshots;
+            Separation == o.Separation && RepathWhenBlocked == o.RepathWhenBlocked && DeltaSnapshots == o.DeltaSnapshots && FogOfWar == o.FogOfWar;
 
         public override bool Equals(object obj) => obj is SimSettings o && Equals(o);
 
@@ -170,7 +184,8 @@ namespace OpenRTS.Shared.Protocol
         public override string ToString() =>
             $"map {Map}, bots {BotCount} {Scenario}, player units {PlayerUnits}, r {UnitRadius:0.##}, speed {UnitSpeed:0.##}, avoidance {(Avoidance ? "on" : "off")} " +
             $"(neighborDist {NeighborDist:0.#}, maxNeighbors {MaxNeighbors}, horizon {TimeHorizon:0.##}), " +
-            $"separation {(Separation ? "on" : "off")}, stopWhenBlocked {StopWhenBlocked}, repath {RepathWhenBlocked}, delta {DeltaSnapshots}";
+            $"separation {(Separation ? "on" : "off")}, stopWhenBlocked {StopWhenBlocked}, repath {RepathWhenBlocked}, delta {DeltaSnapshots}, fog {FogOfWar}";
+
 
         private static float Clamp(float v, float min, float max) => float.IsNaN(v) ? min : Math.Max(min, Math.Min(v, max));
     }
@@ -178,6 +193,9 @@ namespace OpenRTS.Shared.Protocol
     /// <summary>서버가 주기적으로 보내는 충돌 확인 지표.</summary>
     public struct SimStats
     {
+        /// <summary>Fog of War 때문에 알려 주지 않는 값.</summary>
+        public const ushort Unknown = ushort.MaxValue;
+
         public ushort UnitCount;
 
         /// <summary>반지름 합의 5% 넘게 파고든 유닛 쌍 수.</summary>

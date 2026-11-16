@@ -43,11 +43,25 @@ namespace OpenRTS.Client
             effects.Client = client;
             effects.Views = views;
 
+            var fog = root.AddComponent<FogOfWarView>();
+            fog.Client = client;
+            fog.Views = views;
+
+            var ghosts = root.AddComponent<GhostView>();
+            ghosts.Client = client;
+            ghosts.Views = views;
+            ghosts.Fog = fog;
+            effects.Ghosts = ghosts;
+
             var input = root.AddComponent<RtsInput>();
             input.Client = client;
             input.Views = views;
             input.Camera = camera;
             views.Selection = input.Selection;
+
+            var commands = root.AddComponent<CommandPanel>();
+            commands.Client = client;
+            commands.Input = input;
 
             var hud = root.AddComponent<NetDebugHud>();
             hud.Client = client;
@@ -72,12 +86,21 @@ namespace OpenRTS.Client
                 test.Views = views;
             }
 
+            if (EconomyAutoTest.IsRequested())
+            {
+                var test = root.AddComponent<EconomyAutoTest>();
+                test.Client = client;
+                test.Input = input;
+            }
+
             if (BattleAutoTest.IsRequested())
             {
                 var test = root.AddComponent<BattleAutoTest>();
                 test.Client = client;
                 test.Views = views;
                 test.Effects = effects;
+                test.Fog = fog;
+
             }
 
         }

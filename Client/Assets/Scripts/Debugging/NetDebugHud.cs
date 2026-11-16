@@ -73,7 +73,8 @@ namespace OpenRTS.Client.Debugging
             _bannerStyle ??= new GUIStyle(GUI.skin.box) { alignment = TextAnchor.MiddleCenter, fontSize = 18, richText = true };
             var my = Client.MyTeam;
             string Name(int team) => team == my ? $"<color=#6fa0ff>team {team} (you)</color>" : $"<color=#ff7a6a>team {team}</color>";
-            var text = $"{Name(1)}  {s.Team1Alive}  vs  {s.Team2Alive}  {Name(2)}     deaths {s.Deaths}  projectiles {s.Projectiles}";
+            string N(ushort v) => v == OpenRTS.Shared.Protocol.SimStats.Unknown ? "?" : v.ToString(); // 안개 때문에 모름
+            var text = $"{Name(1)}  {N(s.Team1Alive)}  vs  {N(s.Team2Alive)}  {Name(2)}     deaths {N(s.Deaths)}  projectiles {N(s.Projectiles)}";
             if (s.Winner != 0)
             {
                 text += $"\n<b>{(s.Winner == my ? "VICTORY" : my == 0 ? $"team {s.Winner} wins" : "DEFEAT")}</b>  — restarting soon";

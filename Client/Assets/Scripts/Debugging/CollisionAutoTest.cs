@@ -80,6 +80,7 @@ namespace OpenRTS.Client.Debugging
                 s.BotCount = _bots;
                 s.Scenario = _scenario;
                 s.Map = _map;
+                s.PlayerUnits = 1; // 내 무리(무작위 위치)가 봇 교차 경로에 끼어 결과가 흔들리지 않게
                 Client.SendSettings(s);
                 _requested = true;
                 Debug.Log($"[AUTOTEST] requested {_bots} bots {_scenario} on {_map}");

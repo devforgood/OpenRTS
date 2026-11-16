@@ -31,12 +31,15 @@ public sealed class GameServer : IDisposable
     private readonly PacketWriter _writer = new();
     private readonly Action<string> _log;
     private readonly Stopwatch _stepWatch = new();
-    private readonly SnapshotHistory _history = new(HistorySize);
-    private readonly List<SnapshotEntry> _current = new();
-    private readonly Dictionary<uint, List<SnapshotEntry>> _deltas = new(); // baseline 틱 → 변경분 (한 스냅샷 안에서 재사용)
+    private readonly Dictionary<byte, SnapshotHistory> _teamHistory = new(); // 팀 → 그 팀에게 보낸 상태
+    private readonly Dictionary<byte, List<SnapshotEntry>> _teamStates = new();
+    private readonly HashSet<byte> _teams = new();
+    private readonly Dictionary<(byte Team, uint BaseTick), List<SnapshotEntry>> _deltas = new(); // 한 스냅샷 안에서 재사용
     private readonly Stack<List<SnapshotEntry>> _deltaPool = new();
     private readonly List<(int Start, int Count)> _parts = new();
     private readonly List<CombatEvent> _pendingEvents = new();
+    private readonly List<(System.Numerics.Vector2 Attacker, System.Numerics.Vector2 Target)> _pendingEventPositions = new();
+    private readonly List<CombatEvent> _visibleEvents = new();
     private float _commandDelayMs;
     private double _stepMsTotal;
     private int _stepSamples;
@@ -95,6 +98,7 @@ public sealed class GameServer : IDisposable
         _stepSamples++;
 
         _pendingEvents.AddRange(World.Combat.Events);
+        _pendingEventPositions.AddRange(World.Combat.EventPositions);
         World.Combat.ClearEvents();
 
         if (tick % SimConstants.TicksPerSnapshot == 0)
@@ -107,14 +111,55 @@ public sealed class GameServer : IDisposable
         {
             BroadcastStats();
         }
+
+        if (tick % TicksPerPlayerState == 0)
+        {
+            SendPlayerStates();
+        }
+    }
+
+    /// <summary>플레이어별 경제 상태(자원·생산 대기열) 전송 간격 (틱, 5Hz).</summary>
+    public const int TicksPerPlayerState = SimConstants.TickRate / 5;
+
+    /// <summary>각 플레이어에게 자기 자원과 자기 건물의 생산 대기열만 보낸다.</summary>
+    private void SendPlayerStates()
+    {
+        _net.GetConnectedPeers(_peers);
+        foreach (var peer in _peers)
+        {
+            if (!_sessions.TryGetValue(peer.Id, out var session))
+            {
+                continue;
+            }
+
+            _writer.Reset();
+            new PlayerStateMessage
+            {
+                Ore = World.EconomySystem.OreOf(session.PlayerId),
+                Queues = World.EconomySystem.QueuesOf(session.PlayerId),
+            }.Write(_writer);
+            peer.Send(_writer.Buffer, 0, _writer.Length, DeliveryMethod.Unreliable);
+        }
     }
 
     public void Dispose() => _net.Stop();
 
-    /// <summary>최근 보낸 스냅샷 상태 (ID 순, 양자화 값). 테스트·디버그용.</summary>
-    public bool TryGetSentSnapshot(uint tick, out IReadOnlyList<SnapshotEntry> state) => _history.TryGet(tick, out state);
+    /// <summary>최근 <paramref name="team"/> 에게 보낸 스냅샷 상태 (ID 순, 양자화 값). 테스트·디버그용.</summary>
+    public bool TryGetSentSnapshot(byte team, uint tick, out IReadOnlyList<SnapshotEntry> state)
+    {
+        if (_teamHistory.TryGetValue(team, out var history))
+        {
+            return history.TryGet(tick, out state);
+        }
 
+        state = Array.Empty<SnapshotEntry>();
+        return false;
+    }
 
+    /// <summary>
+    /// 스냅샷 전송. 팀마다 그 팀이 볼 수 있는 유닛만 담는다 (Fog of War 전송 필터).
+    /// 보이지 않는 유닛을 노리는 공격 대상 ID 도 0 으로 가린다. 델타 기준도 팀별 보낸 상태로 따로 보관한다.
+    /// </summary>
     private void BroadcastSnapshot(uint tick)
     {
         if (_sessions.Count == 0)
@@ -122,17 +167,45 @@ public sealed class GameServer : IDisposable
             return;
         }
 
-        _current.Clear();
-        foreach (var u in World.CaptureState())
+        var all = World.CaptureState();
+        _teams.Clear();
+        foreach (var session in _sessions.Values)
         {
-            _current.Add(SnapshotEntry.From(u));
+            _teams.Add(World.TeamOf(session.PlayerId));
         }
 
-        _current.Sort(SnapshotDelta.ById);
-
-        foreach (var list in _deltas.Values)
+        foreach (var team in _teams)
         {
-            _deltaPool.Push(list);
+            if (!_teamStates.TryGetValue(team, out var list))
+            {
+                _teamStates[team] = list = new List<SnapshotEntry>();
+                _teamHistory[team] = new SnapshotHistory(HistorySize);
+            }
+
+            list.Clear();
+            foreach (var u in all)
+            {
+                var unit = World.Find(u.Id);
+                if (unit == null || !World.CanSee(team, unit))
+                {
+                    continue;
+                }
+
+                var entry = SnapshotEntry.From(u);
+                if (entry.AttackTarget != 0 && (World.Find(entry.AttackTarget) is not { } target || !World.CanSee(team, target)))
+                {
+                    entry.AttackTarget = 0; // 안개 속 유닛의 ID 를 흘리지 않는다
+                }
+
+                list.Add(entry);
+            }
+
+            list.Sort(SnapshotDelta.ById);
+        }
+
+        foreach (var delta in _deltas.Values)
+        {
+            _deltaPool.Push(delta);
         }
 
         _deltas.Clear();
@@ -144,17 +217,20 @@ public sealed class GameServer : IDisposable
                 continue;
             }
 
+            var team = World.TeamOf(session.PlayerId);
+            var current = _teamStates[team];
+
             // 기준: 클라이언트가 마지막으로 확인한 스냅샷. 없거나 너무 오래됐으면 전체를 보낸다.
             var baseTick = SnapshotMessage.NoBaseline;
-            IReadOnlyList<SnapshotEntry> entries = _current;
-            if (World.Settings.DeltaSnapshots && _history.TryGet(session.LastAck, out var baseline))
+            IReadOnlyList<SnapshotEntry> entries = current;
+            if (World.Settings.DeltaSnapshots && _teamHistory[team].TryGet(session.LastAck, out var baseline))
             {
                 baseTick = session.LastAck;
-                if (!_deltas.TryGetValue(baseTick, out var delta))
+                if (!_deltas.TryGetValue((team, baseTick), out var delta))
                 {
                     delta = _deltaPool.Count > 0 ? _deltaPool.Pop() : new List<SnapshotEntry>();
-                    SnapshotDelta.Diff(baseline, _current, delta);
-                    _deltas.Add(baseTick, delta);
+                    SnapshotDelta.Diff(baseline, current, delta);
+                    _deltas.Add((team, baseTick), delta);
                 }
 
                 entries = delta;
@@ -175,26 +251,61 @@ public sealed class GameServer : IDisposable
             }
         }
 
-        _history.Store(tick, _current);
+        foreach (var team in _teams)
+        {
+            _teamHistory[team].Store(tick, _teamStates[team]);
+        }
     }
 
-    /// <summary>쌓인 전투 이벤트를 연출용으로 보낸다 (unreliable, 패킷 크기에 맞춰 나눔).</summary>
+    /// <summary>
+    /// 쌓인 전투 이벤트를 연출용으로 보낸다 (unreliable, 패킷 크기에 맞춰 나눔).
+    /// 팀마다 공격자나 대상 위치가 그 팀 시야 안인 이벤트만 보낸다.
+    /// </summary>
     private void BroadcastCombatEvents()
     {
         if (_pendingEvents.Count == 0 || _sessions.Count == 0)
         {
             _pendingEvents.Clear();
+            _pendingEventPositions.Clear();
             return;
         }
 
-        for (var start = 0; start < _pendingEvents.Count; start += CombatEventsMessage.MaxPerPacket)
+        _net.GetConnectedPeers(_peers);
+        foreach (var peer in _peers)
         {
-            _writer.Reset();
-            CombatEventsMessage.Write(_writer, _pendingEvents, start, Math.Min(CombatEventsMessage.MaxPerPacket, _pendingEvents.Count - start));
-            SendToJoined(DeliveryMethod.Unreliable);
+            if (!_sessions.TryGetValue(peer.Id, out var session))
+            {
+                continue;
+            }
+
+            var team = World.TeamOf(session.PlayerId);
+            _visibleEvents.Clear();
+            for (var i = 0; i < _pendingEvents.Count; i++)
+            {
+                var (a, t) = _pendingEventPositions[i];
+                var seeAttacker = World.CanSee(team, a);
+                var seeTarget = World.CanSee(team, t);
+                if (seeAttacker || seeTarget)
+                {
+                    // 한쪽만 보이면 안 보이는 쪽 ID 는 가린다 (위치를 모르니 연출에도 쓸 수 없다).
+                    var e = _pendingEvents[i];
+                    if (!seeAttacker) e.Attacker = 0;
+                    if (!seeTarget) e.Target = 0;
+                    _visibleEvents.Add(e);
+                }
+
+            }
+
+            for (var start = 0; start < _visibleEvents.Count; start += CombatEventsMessage.MaxPerPacket)
+            {
+                _writer.Reset();
+                CombatEventsMessage.Write(_writer, _visibleEvents, start, Math.Min(CombatEventsMessage.MaxPerPacket, _visibleEvents.Count - start));
+                peer.Send(_writer.Buffer, 0, _writer.Length, DeliveryMethod.Unreliable);
+            }
         }
 
         _pendingEvents.Clear();
+        _pendingEventPositions.Clear();
     }
 
     private void BroadcastStats()
@@ -215,9 +326,31 @@ public sealed class GameServer : IDisposable
         _snapshotSends = 0;
         _deltaSends = 0;
 
-        _writer.Reset();
-        stats.Write(_writer);
-        SendToJoined(DeliveryMethod.Unreliable);
+        // Fog of War 가 켜져 있으면 상대 팀 정보(생존 수·사망·투사체)를 "모름"으로 가리고,
+        // 유닛 수는 그 팀이 볼 수 있는 수로 보낸다. 겹침 지표는 디버그용이라 전체 기준 그대로.
+        _net.GetConnectedPeers(_peers);
+        foreach (var peer in _peers)
+        {
+            if (!_sessions.TryGetValue(peer.Id, out var session))
+            {
+                continue;
+            }
+
+            var s = stats;
+            if (World.Settings.FogOfWar)
+            {
+                var team = World.TeamOf(session.PlayerId);
+                s.UnitCount = (ushort)Math.Min(ushort.MaxValue, World.Units.Count(u => World.CanSee(team, u)));
+                if (team != 1) s.Team1Alive = SimStats.Unknown;
+                if (team != 2) s.Team2Alive = SimStats.Unknown;
+                s.Deaths = SimStats.Unknown;
+                s.Projectiles = SimStats.Unknown;
+            }
+
+            _writer.Reset();
+            s.Write(_writer);
+            peer.Send(_writer.Buffer, 0, _writer.Length, DeliveryMethod.Unreliable);
+        }
     }
 
     private void BroadcastSettings()

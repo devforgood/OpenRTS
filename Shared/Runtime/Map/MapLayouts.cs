@@ -37,6 +37,44 @@ namespace OpenRTS.Shared.Map
         /// <summary>사각형 위(경계 포함)에서 <paramref name="p"/> 에 가장 가까운 점.</summary>
         public Vector2 ClosestPoint(Vector2 p) => Vector2.Clamp(p, Min, Max);
 
+        /// <summary>선분 a→b 가 사각형(경계 포함)과 겹치는지 (Liang–Barsky 클리핑).</summary>
+        public bool IntersectsSegment(Vector2 a, Vector2 b)
+        {
+            var d = b - a;
+            var t0 = 0f;
+            var t1 = 1f;
+            return Clip(-d.X, a.X - Min.X, ref t0, ref t1)
+                && Clip(d.X, Max.X - a.X, ref t0, ref t1)
+                && Clip(-d.Y, a.Y - Min.Y, ref t0, ref t1)
+                && Clip(d.Y, Max.Y - a.Y, ref t0, ref t1);
+        }
+
+        /// <summary>중심 <paramref name="c"/>, 반지름 <paramref name="r"/> 원의 경계 상자와 겹치는지 (빠른 걸러내기).</summary>
+        public bool OverlapsBox(Vector2 c, float r) =>
+            c.X + r >= Min.X && c.X - r <= Max.X && c.Y + r >= Min.Y && c.Y - r <= Max.Y;
+
+        private static bool Clip(float p, float q, ref float t0, ref float t1)
+        {
+            if (Math.Abs(p) < 1e-12f)
+            {
+                return q >= 0;
+            }
+
+            var t = q / p;
+            if (p < 0)
+            {
+                if (t > t1) return false;
+                if (t > t0) t0 = t;
+            }
+            else
+            {
+                if (t < t0) return false;
+                if (t < t1) t1 = t;
+            }
+
+            return true;
+        }
+
         /// <summary>반시계 방향 꼭짓점 (RVO2 장애물 규약).</summary>
         public Vector2[] CounterClockwise() => new[]
         {

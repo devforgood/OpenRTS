@@ -203,10 +203,73 @@ public sealed class GameServerIntegrationTests : IDisposable
         AssertClientMatchesServer(client); // 체력·공격 대상까지 서버가 보낸 값과 같다
     }
 
+    [Fact]
+    public void FogOfWar_EnemyOutsideVision_IsNeverInAnyPacket_AndAppearsWhenScouted()
+    {
+        using var a = new TestClient(_server.Port);
+        using var b = new TestClient(_server.Port);
+        RunUntil(() => a.MyUnits().Count == PlayerUnits && b.MyUnits().Count == PlayerUnits, a, b);
+        var world = _server.World;
+        Assert.NotEqual(world.TeamOf(a.Welcome!.Value.PlayerId), world.TeamOf(b.Welcome!.Value.PlayerId));
+
+        // 두 무리를 맵 양 끝으로 옮긴다 (시야 10~11 보다 훨씬 멀리).
+        var aUnits = a.MyUnits();
+        var bUnits = b.MyUnits();
+        for (var i = 0; i < PlayerUnits; i++)
+        {
+            world.Find(aUnits[i])!.Position = new Vector2(-40 + i % 3 * 1.5f, i / 3 * 1.5f);
+            world.Find(bUnits[i])!.Position = new Vector2(40 - i % 3 * 1.5f, i / 3 * 1.5f);
+        }
+
+        RunUntil(() => !a.LastSnapshot.Keys.Intersect(bUnits).Any() && !b.LastSnapshot.Keys.Intersect(aUnits).Any(), a, b);
+
+        // 이제부터 a 가 받는 모든 스냅샷 조각에 b 유닛 정보(제거 표시 말고)가 하나도 없어야 한다.
+        a.RawEntries.Clear();
+        for (var i = 0; i < 60; i++)
+        {
+            Step(a, b);
+        }
+
+        Assert.NotEmpty(a.RawEntries); // 패킷은 계속 받았다 (빈 델타 포함)
+        Assert.DoesNotContain(a.RawEntries, e => bUnits.Contains(e.Id) && !e.IsRemoved);
+        Assert.DoesNotContain(a.LastSnapshot.Values, u => u.Team == world.TeamOf(b.Welcome!.Value.PlayerId));
+
+        // a 의 유닛 하나를 b 무리 옆으로 보내면(정찰) 보이기 시작하고, 돌아오면 다시 사라진다.
+        var scout = world.Find(aUnits[0])!;
+        scout.Position = new Vector2(32, 0);
+        RunUntil(() => bUnits.All(a.LastSnapshot.ContainsKey), a, b);
+        scout.Position = new Vector2(-40, 0);
+        RunUntil(() => !a.LastSnapshot.Keys.Intersect(bUnits).Any(), a, b);
+        AssertClientMatchesServer(a);
+    }
+
+    [Fact]
+    public void Skirmish_OverNetwork_TrainWorker_AndEconomyStateIsPrivate()
+    {
+        using var a = new TestClient(_server.Port);
+        using var b = new TestClient(_server.Port);
+        RunUntil(() => a.Settings is not null && b.Settings is not null && a.Welcome is not null && b.Welcome is not null, a, b);
+        var settings = a.Settings!.Value;
+        settings.Scenario = BotScenario.Skirmish;
+        a.SendSettings(settings);
+
+        RunUntil(() => a.PlayerState is { } s && s.Ore == OpenRTS.Shared.Combat.EconomyRules.StartingOre && a.MyUnits().Count == 1 + OpenRTS.Shared.Combat.EconomyRules.StartingWorkers, a, b);
+        var hq = a.LastSnapshot.Values.Single(u => u.Owner == a.Welcome!.Value.PlayerId && u.Kind == OpenRTS.Shared.Combat.UnitKind.Headquarters);
+
+        a.SendCommand(new UnitCommand { Type = CommandType.Train, Kind = OpenRTS.Shared.Combat.UnitKind.Worker, UnitIds = new[] { hq.Id } });
+        RunUntil(() => a.PlayerState is { } s && s.Ore == OpenRTS.Shared.Combat.EconomyRules.StartingOre - OpenRTS.Shared.Combat.UnitArchetypes.Worker.Cost && s.Queues.Count == 1, a, b);
+        Assert.Equal(hq.Id, a.PlayerState!.Value.Queues[0].BuildingId);
+        Assert.True(b.PlayerState is { } bs && bs.Ore == OpenRTS.Shared.Combat.EconomyRules.StartingOre && bs.Queues.Count == 0); // 남의 자원·대기열은 오지 않는다
+
+        RunUntil(() => a.MyUnits().Count == 2 + OpenRTS.Shared.Combat.EconomyRules.StartingWorkers, a, b);
+        Assert.True((a.LastSnapshot[hq.Id].Flags & UnitFlags.Producing) == 0);
+    }
+
     private void AssertClientMatchesServer(TestClient client)
     {
         // 클라이언트가 마지막으로 복원한 틱에 서버가 실제로 보낸 상태와 비교한다.
-        Assert.True(_server.TryGetSentSnapshot(client.LastSnapshotTick, out var sent));
+        var team = _server.World.TeamOf(client.Welcome!.Value.PlayerId);
+        Assert.True(_server.TryGetSentSnapshot(team, client.LastSnapshotTick, out var sent));
         var server = sent.ToDictionary(e => (int)e.Id);
         Assert.Equal(server.Count, client.LastSnapshot.Count);
         foreach (var (id, state) in client.LastSnapshot)
@@ -268,12 +331,18 @@ public sealed class GameServerIntegrationTests : IDisposable
                     case MessageType.SimStats:
                         Stats = SimStats.Read(ref r);
                         break;
+                    case MessageType.PlayerState:
+                        PlayerState = PlayerStateMessage.Read(ref r);
+                        break;
                     case MessageType.CombatEvents:
                         var batch = new List<CombatEvent>();
                         CombatEventsMessage.Read(ref r, batch);
                         Events.AddRange(batch);
                         break;
                     case MessageType.Snapshot:
+                        var raw = new PacketReader(reader.RawData, reader.Position + 1, reader.AvailableBytes - 1);
+                        SnapshotMessage.ReadPart(ref raw, _rawPart, out _, out _, out _);
+                        RawEntries.AddRange(_rawPart);
                         if (Receiver.Receive(ref r, out var tick, out var units))
                         {
                             LastSnapshotTick = tick;
@@ -293,8 +362,22 @@ public sealed class GameServerIntegrationTests : IDisposable
             _net.Connect("127.0.0.1", port, SimConstants.ConnectionKey);
         }
 
+        private readonly List<SnapshotEntry> _rawPart = new();
+
+        /// <summary>받은 모든 스냅샷 조각의 항목 그대로 (복원 전).</summary>
+        public List<SnapshotEntry> RawEntries { get; } = new();
+
         public SnapshotReceiver Receiver { get; } = new();
+
         public List<CombatEvent> Events { get; } = new();
+        public PlayerStateMessage? PlayerState { get; private set; }
+
+        public void SendCommand(UnitCommand command)
+        {
+            _writer.Reset();
+            command.Write(_writer);
+            _peer!.Send(_writer.Buffer, 0, _writer.Length, DeliveryMethod.ReliableOrdered);
+        }
         public bool SawDamage { get; private set; }
 
         public ServerWelcome? Welcome { get; private set; }
