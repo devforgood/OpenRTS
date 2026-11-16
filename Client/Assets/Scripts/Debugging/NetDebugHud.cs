@@ -53,7 +53,7 @@ namespace OpenRTS.Client.Debugging
                     $"{(interp.IsExtrapolating ? "<color=orange>EXTRAPOLATING</color>" : "interpolating")}  units {Views?.InterpolatedPositions.Count}" +
                     (stats.HasValue ? $"  snapshot {stats.Value.SnapshotBytesPerSec / 1024f:0.0} KB/s (delta {stats.Value.DeltaRatio * 100:0}%)\n" : "\n")) +
                 "LMB select/drag · RMB move / attack enemy · Ctrl+RMB attack-move · H stop · Ctrl+A all · Ctrl+1-9 group\n" +
-                "WASD pan · wheel zoom · [ ] latency · - = loss · F1 raw · F2 settings";
+                "Q W E R D F abilities · arrows pan · wheel zoom · [ ] latency · - = loss · F1 raw · F2 settings";
             Area = new Rect(10, 10, 600, 150);
             GUI.Box(Area, text, _style);
             DrawBattle(stats);

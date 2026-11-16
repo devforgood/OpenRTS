@@ -2,6 +2,7 @@ using System;
 using System.Collections.Generic;
 using LiteNetLib;
 using OpenRTS.Shared;
+using OpenRTS.Shared.Abilities;
 using OpenRTS.Shared.Interpolation;
 using OpenRTS.Shared.Protocol;
 using OpenRTS.Shared.Serialization;
@@ -45,6 +46,9 @@ namespace OpenRTS.Client.Net
         private readonly List<int> _myUnits = new List<int>();
         private readonly List<CombatEvent> _eventBuffer = new List<CombatEvent>();
         private readonly List<CombatEvent> _pendingEvents = new List<CombatEvent>();
+        private readonly List<AbilityEvent> _abilityBuffer = new List<AbilityEvent>();
+        private readonly List<AbilityEvent> _pendingAbilityEvents = new List<AbilityEvent>();
+        private readonly List<(int, AbilityId)> _cooldownKeys = new List<(int, AbilityId)>();
         private readonly Queue<DelayedPacket> _inbound = new Queue<DelayedPacket>();
         private readonly Queue<DelayedPacket> _outbound = new Queue<DelayedPacket>();
         private readonly System.Random _random = new System.Random();
@@ -78,6 +82,48 @@ namespace OpenRTS.Client.Net
         public Dictionary<int, ProductionQueue> Queues { get; } = new Dictionary<int, ProductionQueue>();
 
         public bool HasPlayerState { get; private set; }
+
+        /// <summary>렌더 시점이 된 능력 이벤트. 받는 쪽이 비운다.</summary>
+        public List<AbilityEvent> DueAbilityEvents { get; } = new List<AbilityEvent>();
+
+        public int AbilityEventsReceived { get; private set; }
+
+        /// <summary>내 유닛의 능력 재사용 대기 (유닛 ID, 능력) → 남은 초. 서버 값(5Hz) 사이에는 로컬로 줄인다.</summary>
+        public Dictionary<(int Unit, AbilityId Ability), float> Cooldowns { get; } = new Dictionary<(int, AbilityId), float>();
+
+        /// <summary>남은 재사용 대기 (준비됐으면 0).</summary>
+        public float CooldownOf(int unitId, AbilityId ability) => Cooldowns.TryGetValue((unitId, ability), out var t) ? t : 0f;
+
+        /// <summary>능력 이벤트를 받은 순간 (렌더 시각 전). 거부(CastCancel)를 빨리 알아채는 데 쓴다.</summary>
+        public event Action<AbilityEvent> AbilityEventReceived;
+
+        /// <summary>능력 이벤트가 렌더 시각이 되어 재생될 때.</summary>
+        public event Action<AbilityEvent> AbilityEventDue;
+
+        /// <summary>왕복 지연 추정 (실제 + 흉내, 초).</summary>
+        public float RoundTripSeconds => (NetworkRttMs + SimulatedRttMs) / 1000f;
+
+        // 예측한 재사용 대기: 서버 값(PlayerState)이 올 때까지 지켜 준다 (그 전에 오는 PlayerState 가 지우지 않게).
+        private readonly Dictionary<(int, AbilityId), float> _predictedCooldownHold = new Dictionary<(int, AbilityId), float>();
+
+        /// <summary>
+        /// 시전을 보내는 순간 재사용 대기를 미리 걸어 둔다 (버튼이 바로 꺼지고, 서버 확인 전에 두 번 눌러 시전이 다시 시작되는 일을 막음).
+        /// <paramref name="holdSeconds"/> 동안은 서버 상태 메시지에 없더라도 유지하고, 서버 값이 오면 그 값을 따른다.
+        /// </summary>
+        public void PredictCooldown(int unitId, AbilityId ability, float seconds, float holdSeconds)
+        {
+            Cooldowns[(unitId, ability)] = seconds;
+            _predictedCooldownHold[(unitId, ability)] = Time.realtimeSinceStartup + holdSeconds;
+        }
+
+        /// <summary>예측이 틀렸을 때(서버가 거부) 미리 걸어 둔 재사용 대기를 푼다.</summary>
+        public void ClearPredictedCooldown(int unitId, AbilityId ability)
+        {
+            if (_predictedCooldownHold.Remove((unitId, ability)))
+            {
+                Cooldowns.Remove((unitId, ability));
+            }
+        }
 
         /// <summary>최신 스냅샷 기준 내 유닛 ID (오름차순).</summary>
         public IReadOnlyList<int> MyUnits => _myUnits;
@@ -143,6 +189,51 @@ namespace OpenRTS.Client.Net
 
             Interpolator?.Advance(Time.unscaledDeltaTime);
             ReleaseDueEvents();
+            ReleaseDueAbilityEvents();
+            TickCooldowns(Time.unscaledDeltaTime);
+        }
+
+        private void ReleaseDueAbilityEvents()
+        {
+            if (Interpolator == null || _pendingAbilityEvents.Count == 0)
+            {
+                return;
+            }
+
+            var renderTime = Interpolator.RenderTime;
+            for (var i = 0; i < _pendingAbilityEvents.Count; i++)
+            {
+                if (_pendingAbilityEvents[i].Tick * (double)SimConstants.TickDelta <= renderTime)
+                {
+                    DueAbilityEvents.Add(_pendingAbilityEvents[i]);
+                    AbilityEventDue?.Invoke(_pendingAbilityEvents[i]);
+                    _pendingAbilityEvents.RemoveAt(i);
+                    i--;
+                }
+            }
+
+            if (_pendingAbilityEvents.Count > 2000)
+            {
+                _pendingAbilityEvents.RemoveRange(0, _pendingAbilityEvents.Count - 2000);
+            }
+        }
+
+        private void TickCooldowns(float dt)
+        {
+            _cooldownKeys.Clear();
+            _cooldownKeys.AddRange(Cooldowns.Keys);
+            foreach (var key in _cooldownKeys)
+            {
+                var left = Cooldowns[key] - dt;
+                if (left <= 0)
+                {
+                    Cooldowns.Remove(key);
+                }
+                else
+                {
+                    Cooldowns[key] = left;
+                }
+            }
         }
 
         /// <summary>이벤트는 그 틱의 위치가 화면에 그려질 때(렌더 시각) 재생한다.</summary>
@@ -193,7 +284,14 @@ namespace OpenRTS.Client.Net
             SendCommand(type, unitIds, target, targetUnit, OpenRTS.Shared.Combat.UnitKind.Melee);
 
         /// <summary>Build·Train 처럼 종류가 필요한 명령.</summary>
-        public void SendCommand(CommandType type, IReadOnlyList<int> unitIds, Vector2 target, int targetUnit, OpenRTS.Shared.Combat.UnitKind kind)
+        public void SendCommand(CommandType type, IReadOnlyList<int> unitIds, Vector2 target, int targetUnit, OpenRTS.Shared.Combat.UnitKind kind) =>
+            SendCommand(type, unitIds, target, targetUnit, kind, AbilityId.None);
+
+        /// <summary>능력 사용 명령.</summary>
+        public void SendCast(IReadOnlyList<int> unitIds, AbilityId ability, Vector2 point, int targetUnit) =>
+            SendCommand(CommandType.Cast, unitIds, point, targetUnit, OpenRTS.Shared.Combat.UnitKind.Melee, ability);
+
+        private void SendCommand(CommandType type, IReadOnlyList<int> unitIds, Vector2 target, int targetUnit, OpenRTS.Shared.Combat.UnitKind kind, AbilityId ability)
         {
             if (State != ClientState.Joined || unitIds == null || unitIds.Count == 0)
             {
@@ -211,7 +309,7 @@ namespace OpenRTS.Client.Net
                 }
 
                 _writer.Reset();
-                new UnitCommand { Type = type, Target = target, TargetUnit = targetUnit, ClientTick = clientTick, Kind = kind, UnitIds = chunk }.Write(_writer);
+                new UnitCommand { Type = type, Target = target, TargetUnit = targetUnit, ClientTick = clientTick, Kind = kind, Ability = ability, UnitIds = chunk }.Write(_writer);
                 Send(_writer.ToArray(), DeliveryMethod.ReliableOrdered);
             }
         }
@@ -340,7 +438,42 @@ namespace OpenRTS.Client.Net
                             Queues[q.BuildingId] = q;
                         }
 
+                        // 예측한 재사용 대기는 지킴 시간 동안 남긴다. 서버 값이 있으면 서버 값으로 바꾸고 예측은 끝.
+                        var keep = new List<KeyValuePair<(int, AbilityId), float>>();
+                        foreach (var kv in Cooldowns)
+                        {
+                            if (_predictedCooldownHold.TryGetValue(kv.Key, out var until) && until > Time.realtimeSinceStartup)
+                            {
+                                keep.Add(kv);
+                            }
+                        }
+
+                        Cooldowns.Clear();
+                        foreach (var kv in keep)
+                        {
+                            Cooldowns[kv.Key] = kv.Value;
+                        }
+
+                        if (ps.Cooldowns != null)
+                        {
+                            foreach (var c in ps.Cooldowns)
+                            {
+                                Cooldowns[(c.UnitId, c.Ability)] = c.Remaining;
+                                _predictedCooldownHold.Remove((c.UnitId, c.Ability));
+                            }
+                        }
+
                         HasPlayerState = true;
+                        break;
+
+                    case MessageType.AbilityEvents:
+                        AbilityEventsMessage.Read(ref r, _abilityBuffer);
+                        AbilityEventsReceived += _abilityBuffer.Count;
+                        _pendingAbilityEvents.AddRange(_abilityBuffer);
+                        foreach (var e in _abilityBuffer)
+                        {
+                            AbilityEventReceived?.Invoke(e);
+                        }
                         break;
 
                     case MessageType.CombatEvents:

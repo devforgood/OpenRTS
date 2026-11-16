@@ -23,6 +23,9 @@ namespace OpenRTS.Shared.Combat
 
         /// <summary>광맥: 중립 자원. 캐면 줄어들고 다 캐면 사라진다.</summary>
         OreField = 5,
+
+        /// <summary>영웅: 능력 4개를 가진 강한 유닛. 본진에서 생산, Battle 에서는 팀마다 봇 영웅.</summary>
+        Hero = 6,
     }
 
     /// <summary>유닛 종류별 수치. 거리는 "가장자리 사이" 기준 (중심 거리 - 두 유닛의 크기).</summary>
@@ -108,6 +111,10 @@ namespace OpenRTS.Shared.Combat
             maxHp: 700, damage: 0, range: 0, cooldown: 0, windup: 0, acquisitionRange: 0, projectileSpeed: 0, sightRange: 8f,
             cost: 150, buildTime: 15f, footprint: 1.5f);
 
+        public static readonly UnitArchetype Hero = new UnitArchetype(
+            maxHp: 320, damage: 14, range: 4f, cooldown: 1.0f, windup: 0.25f, acquisitionRange: 8f, projectileSpeed: 20f, sightRange: 12f,
+            cost: 200, buildTime: 15f);
+
         public static readonly UnitArchetype OreField = new UnitArchetype(
             maxHp: 1, damage: 0, range: 0, cooldown: 0, windup: 0, acquisitionRange: 0, projectileSpeed: 0, sightRange: 0,
             footprint: 0.6f);
@@ -121,6 +128,7 @@ namespace OpenRTS.Shared.Combat
                 case UnitKind.Headquarters: return Headquarters;
                 case UnitKind.Barracks: return Barracks;
                 case UnitKind.OreField: return OreField;
+                case UnitKind.Hero: return Hero;
                 default: return Melee;
             }
         }
@@ -132,7 +140,7 @@ namespace OpenRTS.Shared.Combat
         {
             switch (producer)
             {
-                case UnitKind.Headquarters: return product == UnitKind.Worker;
+                case UnitKind.Headquarters: return product == UnitKind.Worker || product == UnitKind.Hero;
                 case UnitKind.Barracks: return product == UnitKind.Melee || product == UnitKind.Ranged;
                 default: return false;
             }

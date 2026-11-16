@@ -1,6 +1,6 @@
 # 프로토콜
 
-현재 버전: **7** (`SimConstants.ProtocolVersion`). 전송은 LiteNetLib 2.1.5 UDP, 접속 키 `"OpenRTS"`(보안 수단 아님), 기본 포트 7777.
+현재 버전: **9** (`SimConstants.ProtocolVersion`). 전송은 LiteNetLib 2.1.5 UDP, 접속 키 `"OpenRTS"`(보안 수단 아님), 기본 포트 7777.
 
 ## 1. 공통 규칙
 
@@ -25,6 +25,7 @@
 | 9 | SnapshotAck | C→S | unreliable | 스냅샷 복원마다 | `SnapshotAck` |
 | 10 | CombatEvents | S→C | unreliable | 스냅샷과 같이 | `CombatEventsMessage` |
 | 11 | PlayerState | S→C | unreliable | 5Hz | `PlayerStateMessage` |
+| 12 | AbilityEvents | S→C | unreliable | 스냅샷과 같이 | `AbilityEventsMessage` |
 
 6·7 은 서버가 `--no-debug-commands` 로 떠 있으면 무시합니다.
 
@@ -47,11 +48,12 @@ S: SimSettings
 
 ```text
 byte  type = 3
-byte  CommandType      0 Move, 1 AttackMove, 2 Attack, 3 Stop, 4 Gather, 5 Build, 6 Train
+byte  CommandType      0 Move, 1 AttackMove, 2 Attack, 3 Stop, 4 Gather, 5 Build, 6 Train, 7 Cast
 float target.x, target.y   (Move/AttackMove/Build 지점, Gather 의 비일꾼 이동 지점)
-u16   targetUnit       (Attack 대상, Gather 의 광맥·건설 중 건물)
-u32   clientTick       (보낼 때 클라이언트가 추정한 서버 틱. 서버가 명령 지연을 잼)
+u16   targetUnit       (Attack 대상, Gather 의 광맥·건설 중 건물, Cast 의 유닛 대상)
+u32   clientTick       (보낼 때 클라이언트가 추정한 서버 틱. 서버가 명령 지연을 재서 능력 선딜 보상에 씀 — abilities.md 9.2)
 byte  UnitKind         (Build·Train 의 종류)
+byte  AbilityId        (Cast 의 능력)
 byte  count (≤255)
 u16 × count  unitIds
 ```
@@ -78,7 +80,7 @@ byte fields         SnapshotFields 비트: 1 Position, 2 Info, 4 Health, 8 Actio
 
 - 좌표 양자화: `q = round(v / MapHalfSize × 32767)`, 범위 ±50 → 해상도 약 0.0015. `short.MinValue` 는 쓰지 않음.
 - 체력: `ceil(비율 × 255)`, 살아 있으면 최소 1. 광맥은 남은 양 비율, 건설 중 건물은 진행도만큼의 체력 비율.
-- `UnitFlags`: 1 WindingUp(선딜 중), 2 Carrying(자원 운반), 4 UnderConstruction, 8 Producing.
+- `UnitFlags`: 1 WindingUp(선딜 중), 2 Carrying(자원 운반), 4 UnderConstruction, 8 Producing, 16 Stunned, 32 Casting(능력 선딜·정신 집중·돌진), 64 Slowed, 128 Shielded.
 - 항목 크기: 전체 14, 위치만 7, 체력만 4, 행동만 6, 제거 3.
 - 조각 나누기: `SnapshotMessage.Plan(entries, maxPacketSize, parts)` 가 바이트 기준으로 자릅니다. **항목이 없어도 빈 조각 하나는 보냅니다**(클라이언트가 그 틱을 확인 응답해야 다음 델타 기준이 생김).
 
@@ -121,9 +123,22 @@ byte type = 11
 i32  ore
 byte queueCount
 반복: u16 buildingId, byte itemCount, byte × itemCount (UnitKind), byte progress(0~255, 첫 항목)
+byte cooldownCount (≤150)
+반복: u16 unitId, byte AbilityId, u16 remaining (0.1초 단위, 올림)
 ```
 
-그 플레이어에게만 보냅니다. 대기열이 빈 건물은 없음.
+그 플레이어에게만 보냅니다. 대기열이 빈 건물, 준비된 능력은 없음.
+
+### AbilityEvents
+
+```text
+byte type = 12
+u16  count (패킷당 ≤70)
+반복: u32 tick, byte AbilityEventType, u16 caster, byte AbilityId, u16 target, i16 x, i16 y (좌표는 스냅샷과 같은 양자화)
+```
+
+`AbilityEventType`: 0 CastStart, 1 CastCancel(시전이 끊김 또는 **시전 명령 거부**), 2 ProjectileLaunch(지점 = 비행 끝), 3 ProjectileEnd(지점 = 끝난 위치), 4 AreaTelegraph, 5 AreaHit, 6 DashStart(지점 = 도착), 7 ChannelStart, 8 Hit(target = 맞은 유닛).
+팀마다 시전자 위치나 지점이 보일 때만 보내고, 안 보이는 시전자·대상 ID 는 0. 렌더 시각에 재생합니다(CombatEvents 와 같음).
 
 ### SimSettings (5, 6)
 
@@ -131,7 +146,7 @@ byte queueCount
 byte type, u16 botCount, byte scenario, byte map, byte playerUnits,
 float unitRadius, float unitSpeed, byte avoidance, float neighborDist, byte maxNeighbors,
 float timeHorizon, byte stopWhenBlocked, byte separation, byte repathWhenBlocked,
-byte deltaSnapshots, byte fogOfWar
+byte deltaSnapshots, byte fogOfWar, byte lagCompensation
 ```
 
 서버는 받은 값을 반드시 `Clamped()` 로 범위를 자른 뒤 적용하고, 적용한 값을 모두에게 다시 보냅니다.

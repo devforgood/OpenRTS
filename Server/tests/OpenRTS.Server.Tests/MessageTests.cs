@@ -222,6 +222,46 @@ public class MessageTests
     }
 
     [Fact]
+    public void AbilityMessages_RoundTrip()
+    {
+        var w = new PacketWriter();
+        new UnitCommand { Type = CommandType.Cast, Ability = OpenRTS.Shared.Abilities.AbilityId.Leap, Target = new Vector2(1, 2), TargetUnit = 9, UnitIds = new[] { 3 } }.Write(w);
+        var r = new PacketReader(w.ToArray());
+        r.ReadByte();
+        var cmd = UnitCommand.Read(ref r);
+        Assert.Equal((CommandType.Cast, OpenRTS.Shared.Abilities.AbilityId.Leap, 9), (cmd.Type, cmd.Ability, cmd.TargetUnit));
+
+        var events = new List<AbilityEvent>
+        {
+            new() { Tick = 5, Type = AbilityEventType.AreaTelegraph, Caster = 7, Ability = OpenRTS.Shared.Abilities.AbilityId.Volley, Target = 0, Point = new Vector2(3.5f, -2.25f) },
+            new() { Tick = 6, Type = AbilityEventType.Hit, Caster = 7, Ability = OpenRTS.Shared.Abilities.AbilityId.Volley, Target = 8, Point = new Vector2(-49, 49) },
+        };
+        w.Reset();
+        AbilityEventsMessage.Write(w, events, 0, events.Count);
+        Assert.True(3 + AbilityEventsMessage.MaxPerPacket * 14 <= 1023);
+        r = new PacketReader(w.ToArray());
+        Assert.Equal(MessageType.AbilityEvents, (MessageType)r.ReadByte());
+        var decoded = new List<AbilityEvent>();
+        AbilityEventsMessage.Read(ref r, decoded);
+        Assert.Equal(events.Select(e => (e.Tick, e.Type, e.Caster, e.Ability, e.Target)), decoded.Select(e => (e.Tick, e.Type, e.Caster, e.Ability, e.Target)));
+        Assert.True(Vector2.Distance(events[0].Point, decoded[0].Point) < 0.002f);
+
+        w.Reset();
+        new PlayerStateMessage
+        {
+            Ore = 42,
+            Queues = new List<ProductionQueue>(),
+            Cooldowns = new List<AbilityCooldown> { new() { UnitId = 11, Ability = OpenRTS.Shared.Abilities.AbilityId.Nova, Remaining = 3.33f } },
+        }.Write(w);
+        r = new PacketReader(w.ToArray());
+        r.ReadByte();
+        var ps = PlayerStateMessage.Read(ref r);
+        var cd = Assert.Single(ps.Cooldowns);
+        Assert.Equal((11, OpenRTS.Shared.Abilities.AbilityId.Nova), (cd.UnitId, cd.Ability));
+        Assert.InRange(cd.Remaining, 3.33f, 3.41f); // 0.1초 단위로 올림
+    }
+
+    [Fact]
     public void TruncatedOrInvalidCommand_Throws()
     {
         var w = new PacketWriter();

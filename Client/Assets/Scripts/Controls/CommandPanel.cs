@@ -1,5 +1,6 @@
 using System.Text;
 using OpenRTS.Client.Net;
+using OpenRTS.Shared.Abilities;
 using OpenRTS.Shared.Combat;
 using OpenRTS.Shared.Protocol;
 using UnityEngine;
@@ -30,6 +31,7 @@ namespace OpenRTS.Client.Controls
                 return;
             }
 
+
             _box ??= new GUIStyle(GUI.skin.box) { alignment = TextAnchor.UpperLeft, richText = true, fontSize = 14 };
             _button ??= new GUIStyle(GUI.skin.button) { richText = true, fontSize = 13 };
 
@@ -37,7 +39,7 @@ namespace OpenRTS.Client.Controls
             var hqs = Input.SelectedCount(UnitKind.Headquarters);
             var barracks = Input.SelectedCount(UnitKind.Barracks);
 
-            var rect = new Rect(10, Screen.height - 190, 420, 180);
+            var rect = new Rect(10, Screen.height - 240, 520, 230);
             Area = rect;
             GUILayout.BeginArea(rect, _box);
             GUILayout.Label($"<b><color=#7fe0f0>Ore {Client.Ore}</color></b>    selected {Input.Selection.Count}" +
@@ -52,6 +54,7 @@ namespace OpenRTS.Client.Controls
             if (hqs > 0)
             {
                 Button($"Worker ({UnitArchetypes.Worker.Cost})  [Z]", UnitArchetypes.Worker.Cost, () => Input.Train(UnitKind.Worker));
+                Button($"Hero ({UnitArchetypes.Hero.Cost})  [C]", UnitArchetypes.Hero.Cost, () => Input.Train(UnitKind.Hero));
             }
 
             if (barracks > 0)
@@ -61,6 +64,35 @@ namespace OpenRTS.Client.Controls
             }
 
             GUILayout.EndHorizontal();
+
+            // 능력: 선택한 유닛들이 가진 것 (단축키 순서). 재사용 대기 중이면 남은 초.
+            var abilities = Input.AvailableAbilities();
+            if (abilities.Count > 0)
+            {
+                GUILayout.BeginHorizontal();
+                for (var i = 0; i < abilities.Count && i < RtsInput.AbilityKeys.Length; i++)
+                {
+                    var id = abilities[i];
+                    var def = AbilityCatalog.Get(id);
+                    var wait = Input.ReadyIn(id);
+                    var label = wait > 0 ? $"{def.Name}\n<color=#999>{wait:0.0}s</color>" : $"<b>{def.Name}</b>\n[{RtsInput.AbilityKeys[i]}]";
+                    var enabled = GUI.enabled;
+                    GUI.enabled = wait <= 0;
+                    if (GUILayout.Button(label, _button, GUILayout.Height(40)))
+                    {
+                        Input.BeginAbility(id);
+                    }
+
+                    GUI.enabled = enabled;
+                }
+
+                GUILayout.EndHorizontal();
+            }
+
+            if (Input.Targeting.HasValue)
+            {
+                GUILayout.Label($"{AbilityCatalog.Get(Input.Targeting.Value).Name}: left-click target, right-click / Esc to cancel");
+            }
 
             if (Input.Placing.HasValue)
             {

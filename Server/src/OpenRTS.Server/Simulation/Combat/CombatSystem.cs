@@ -25,6 +25,9 @@ public enum UnitOrder : byte
 
     /// <summary>일꾼: 건물을 짓는다 (경제 시스템이 실행, 적은 무시).</summary>
     Build,
+
+    /// <summary>능력 시전 중 (능력 시스템이 실행, 끝나면 시전 전 명령으로 돌아감).</summary>
+    Cast,
 }
 
 /// <summary>
@@ -203,6 +206,13 @@ public sealed class CombatSystem
                 continue; // 중립·건물은 싸우지 않는다
             }
 
+            if (u.IsStunned)
+            {
+                u.Windup = 0; // 기절: 공격도 못 한다 (쿨다운은 흐른다)
+                u.Cooldown = MathF.Max(0, u.Cooldown - dt);
+                continue;
+            }
+
             u.Cooldown = MathF.Max(0, u.Cooldown - dt);
             u.TimeSinceAttack += dt;
 
@@ -223,7 +233,8 @@ public sealed class CombatSystem
             {
                 case UnitOrder.Gather:
                 case UnitOrder.Build:
-                    continue; // 일하는 중에는 적을 무시 (경제 시스템이 움직임을 맡는다)
+                case UnitOrder.Cast:
+                    continue; // 일하거나 시전 중에는 적을 무시 (다른 시스템이 움직임을 맡는다)
 
                 case UnitOrder.Move:
                     if (!u.IsMoving)
@@ -431,6 +442,7 @@ public sealed class CombatSystem
             return;
         }
 
+        damage = _world.AbilitySystem.Absorb(target, damage); // 보호막이 먼저 받는다
         target.Hp -= damage;
         if (target.Hp <= 0)
         {

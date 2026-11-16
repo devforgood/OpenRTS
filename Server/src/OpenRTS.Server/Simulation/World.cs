@@ -112,6 +112,76 @@ public sealed class Unit
 
     /// <summary>전투 봇이 상대 진영까지 가 봤는지 (그 뒤로는 맵을 정찰).</summary>
     internal bool Searched { get; set; }
+
+    // ── 능력·상태 ─────────────────────────────────────────
+
+    /// <summary>이 유닛이 가진 능력 (종류별 보유 목록 순서). 생성할 때 정해진다.</summary>
+    public List<Abilities.AbilityState> Abilities { get; } = new();
+
+    /// <summary>진행 중인 시전 (없으면 null).</summary>
+    public Abilities.ActiveCast? Cast { get; internal set; }
+
+    /// <summary>걸린 상태 효과 (기절·둔화·보호막).</summary>
+    public List<Abilities.StatusInstance> Statuses { get; } = new();
+
+    /// <summary>돌진 중이면 목적지.</summary>
+    public Vector2? DashTarget { get; internal set; }
+
+    internal float DashSpeed { get; set; }
+
+    public bool IsDashing => DashTarget.HasValue;
+
+    public bool IsStunned
+    {
+        get
+        {
+            foreach (var s in Statuses)
+            {
+                if (s.Type == Shared.Abilities.StatusType.Stun)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+    }
+
+    /// <summary>이동 속도 배율: 기절이면 0, 둔화는 가장 센 것 하나만.</summary>
+    public float SpeedMultiplier
+    {
+        get
+        {
+            var slow = 0f;
+            foreach (var s in Statuses)
+            {
+                if (s.Type == Shared.Abilities.StatusType.Stun)
+                {
+                    return 0f;
+                }
+
+                if (s.Type == Shared.Abilities.StatusType.Slow)
+                {
+                    slow = MathF.Max(slow, s.Magnitude);
+                }
+            }
+
+            return 1f - Math.Clamp(slow, 0f, 0.95f);
+        }
+    }
+
+    public Abilities.AbilityState? FindAbility(Shared.Abilities.AbilityId id)
+    {
+        foreach (var a in Abilities)
+        {
+            if (a.Id == id)
+            {
+                return a;
+            }
+        }
+
+        return null;
+    }
     internal int IgnoreTargetId { get; set; }
     internal float IgnoreTimer { get; set; }
 
@@ -288,11 +358,15 @@ public sealed class World
         Combat = new CombatSystem(this);
         Ai = new BattleAi(this);
         EconomySystem = new Economy.EconomySystem(this);
+        AbilitySystem = new Abilities.AbilitySystem(this);
         BuildMap();
     }
 
     /// <summary>자원·생산·건설.</summary>
     public Economy.EconomySystem EconomySystem { get; }
+
+    /// <summary>능력 시전·투사체·범위·돌진·상태 효과.</summary>
+    public Abilities.AbilitySystem AbilitySystem { get; }
 
     public CombatSystem Combat { get; }
 
@@ -338,6 +412,11 @@ public sealed class World
         if (kind == UnitKind.OreField)
         {
             unit.Ore = EconomyRules.OrePerField;
+        }
+
+        foreach (var abilityId in Shared.Abilities.AbilityCatalog.LoadoutOf(kind))
+        {
+            unit.Abilities.Add(new Abilities.AbilityState(Shared.Abilities.AbilityCatalog.Get(abilityId)));
         }
 
         _units.Add(unit);
@@ -443,8 +522,9 @@ public sealed class World
     /// 플레이어 명령: <paramref name="owner"/> 가 소유한 유닛만 골라 실행한다.
     /// 이동·공격 이동은 대형을 짜서 각자 칸으로 보낸다. 명령은 하던 공격(선딜 포함)을 취소한다.
     /// </summary>
+    /// <param name="commandDelay">명령이 서버에 오기까지 걸린 시간(초, 서버가 ClientTick 으로 잼). 능력 선딜 보상에 쓴다.</param>
     /// <returns>실제로 명령을 받은 유닛 수.</returns>
-    public int Command(byte owner, UnitCommand command)
+    public int Command(byte owner, UnitCommand command, float commandDelay = 0f)
     {
         var unitIds = command.UnitIds ?? Array.Empty<int>();
         var target = command.Target;
@@ -466,6 +546,9 @@ public sealed class World
 
             case CommandType.Build:
                 return EconomySystem.Build(owner, group, command.Kind, command.Target);
+
+            case CommandType.Cast:
+                return AbilitySystem.Command(group, command.Ability, command.TargetUnit, command.Target, Settings.LagCompensation ? commandDelay : 0f);
         }
 
         // 건물은 아래 명령(이동·공격·정지·채집)을 받지 않는다.
@@ -473,6 +556,7 @@ public sealed class World
         foreach (var u in group)
         {
             EconomySystem.CancelWork(u); // 짓기 전에 취소하면 비용을 돌려준다
+            AbilitySystem.Cancel(u, emit: true); // 새 명령은 하던 시전을 끊는다
             u.Windup = 0;
             u.AttackTargetId = 0;
         }
@@ -571,6 +655,7 @@ public sealed class World
         _restartTimer = 0;
         Combat.Reset();
         EconomySystem.Reset();
+        AbilitySystem.Reset();
 
         if (Settings.Scenario == BotScenario.Skirmish)
         {
@@ -620,6 +705,7 @@ public sealed class World
         profile.Ai = Lap(ref mark);
         Combat.UpdateUnits(dt);
         EconomySystem.Update(dt);
+        AbilitySystem.Update(dt);
         profile.Combat = Lap(ref mark);
         UpdateWaypoints();
 
@@ -639,7 +725,13 @@ public sealed class World
         for (var i = 0; i < _units.Count; i++)
         {
             var u = _units[i];
-            var pref = PreferredVelocity(u, s.UnitSpeed, dt);
+            if (u.IsDashing)
+            {
+                _newVelocities.Add(DashVelocity(u, dt)); // 돌진은 회피하지 않는다 (벽 밀어내기는 받음)
+                continue;
+            }
+
+            var pref = PreferredVelocity(u, SpeedOf(u), dt);
             _newVelocities.Add(u.IsStatic ? Vector2.Zero : s.Avoidance ? Avoid(i, pref, dt) : pref);
         }
 
@@ -650,9 +742,10 @@ public sealed class World
         {
             var u = _units[i];
             var v = _newVelocities[i];
-            if (v.LengthSquared() > s.UnitSpeed * s.UnitSpeed)
+            var maxSpeed = u.IsDashing ? u.DashSpeed : SpeedOf(u);
+            if (v.LengthSquared() > maxSpeed * maxSpeed)
             {
-                v = Vector2.Normalize(v) * s.UnitSpeed;
+                v = maxSpeed > 0 ? Vector2.Normalize(v) * maxSpeed : Vector2.Zero;
             }
 
             if (!float.IsFinite(v.X) || !float.IsFinite(v.Y))
@@ -697,6 +790,7 @@ public sealed class World
         profile.Arrival = Lap(ref mark);
 
         Combat.UpdateProjectiles(dt);
+        AbilitySystem.UpdateAfterMovement(dt);
         Combat.CollectDead(_dead);
         foreach (var id in _dead)
         {
@@ -767,6 +861,10 @@ public sealed class World
             var flags = unit.Windup > 0 ? UnitFlags.WindingUp : UnitFlags.None;
             if (unit.Carrying > 0) flags |= UnitFlags.Carrying;
             if (unit.UnderConstruction) flags |= UnitFlags.UnderConstruction;
+            if (unit.IsStunned) flags |= UnitFlags.Stunned;
+            if (unit.Cast != null || unit.IsDashing) flags |= UnitFlags.Casting;
+            if (unit.SpeedMultiplier < 0.999f && !unit.IsStunned) flags |= UnitFlags.Slowed;
+            if (AbilitySystem.ShieldOf(unit) > 0) flags |= UnitFlags.Shielded;
             if (unit.Queue.Count > 0 && !unit.UnderConstruction) flags |= UnitFlags.Producing;
             _stateBuffer.Add(new UnitState
             {
@@ -930,7 +1028,9 @@ public sealed class World
         var k = 0;
         foreach (var offset in Scenarios.Block(count, spacing))
         {
-            var kind = k++ % 2 == 0 ? UnitKind.Melee : UnitKind.Ranged;
+            // 첫 유닛은 영웅 (능력 4개), 나머지는 근접·원거리 번갈아
+            var kind = k == 0 ? UnitKind.Hero : k % 2 == 1 ? UnitKind.Melee : UnitKind.Ranged;
+            k++;
             var unit = Spawn(center + offset, owner: owner, team: team, kind: kind);
             unit.Order = UnitOrder.Idle;
             result.Add(unit);
@@ -1149,6 +1249,16 @@ public sealed class World
         }
     }
 
+    /// <summary>유닛의 지금 이동 속도 (설정 속도 × 상태 효과 배율).</summary>
+    public float SpeedOf(Unit u) => Settings.UnitSpeed * u.SpeedMultiplier;
+
+    private static Vector2 DashVelocity(Unit u, float dt)
+    {
+        var to = u.DashTarget!.Value - u.Position;
+        var dist = to.Length();
+        return dist < 1e-6f ? Vector2.Zero : to / dist * MathF.Min(u.DashSpeed, dist / dt);
+    }
+
     private static Vector2 PreferredVelocity(Unit u, float speed, float dt)
     {
         if (u.Waypoint is not { } waypoint)
@@ -1198,11 +1308,11 @@ public sealed class World
 
         if (_obstacles.Count == 0)
         {
-            return _orca.ComputeNewVelocity(self.Position, self.Velocity, pref, radius, s.UnitSpeed, _neighbors, s.TimeHorizon, dt);
+            return _orca.ComputeNewVelocity(self.Position, self.Velocity, pref, radius, SpeedOf(self), _neighbors, s.TimeHorizon, dt);
         }
 
         OrcaSolver.FindObstacleNeighbors(self.Position, ObstacleTimeHorizon * s.UnitSpeed + radius, _obstacles, _obstacleNeighbors, _obstacleDistances);
-        return _orca.ComputeNewVelocity(self.Position, self.Velocity, pref, radius, s.UnitSpeed, _neighbors, s.TimeHorizon, dt, _obstacleNeighbors, ObstacleTimeHorizon);
+        return _orca.ComputeNewVelocity(self.Position, self.Velocity, pref, radius, SpeedOf(self), _neighbors, s.TimeHorizon, dt, _obstacleNeighbors, ObstacleTimeHorizon);
     }
 
     /// <summary>

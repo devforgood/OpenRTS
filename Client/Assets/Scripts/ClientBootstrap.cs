@@ -43,6 +43,15 @@ namespace OpenRTS.Client
             effects.Client = client;
             effects.Views = views;
 
+            var prediction = root.AddComponent<CastPrediction>();
+            prediction.Client = client;
+            prediction.Views = views;
+            views.Prediction = prediction;
+
+            var abilityEffects = root.AddComponent<AbilityEffects>();
+            abilityEffects.Client = client;
+            abilityEffects.Views = views;
+
             var fog = root.AddComponent<FogOfWarView>();
             fog.Client = client;
             fog.Views = views;
@@ -58,6 +67,8 @@ namespace OpenRTS.Client
             input.Views = views;
             input.Camera = camera;
             views.Selection = input.Selection;
+
+            input.Prediction = prediction;
 
             var commands = root.AddComponent<CommandPanel>();
             commands.Client = client;
@@ -93,6 +104,15 @@ namespace OpenRTS.Client
                 test.Input = input;
             }
 
+            if (CastLatencyAutoTest.IsRequested())
+            {
+                var test = root.AddComponent<CastLatencyAutoTest>();
+                test.Client = client;
+                test.Views = views;
+                test.Input = input;
+                test.Prediction = prediction;
+            }
+
             if (BattleAutoTest.IsRequested())
             {
                 var test = root.AddComponent<BattleAutoTest>();
@@ -100,6 +120,7 @@ namespace OpenRTS.Client
                 test.Views = views;
                 test.Effects = effects;
                 test.Fog = fog;
+                test.AbilityEffects = abilityEffects;
 
             }
 

@@ -109,6 +109,7 @@ namespace OpenRTS.Client.Debugging
             GUILayout.Label("<b>Network</b>", Rich());
             _draft.DeltaSnapshots = GUILayout.Toggle(_draft.DeltaSnapshots, " delta snapshots (send changed units only)");
             _draft.FogOfWar = GUILayout.Toggle(_draft.FogOfWar, " fog of war (don't send enemies outside team vision)");
+            _draft.LagCompensation = GUILayout.Toggle(_draft.LagCompensation, " ability lag compensation (shorten windup by command delay, ≤ min(½ windup, 0.1s))");
 
 
             if (!_draft.Equals(before))

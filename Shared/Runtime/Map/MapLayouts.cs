@@ -38,15 +38,23 @@ namespace OpenRTS.Shared.Map
         public Vector2 ClosestPoint(Vector2 p) => Vector2.Clamp(p, Min, Max);
 
         /// <summary>선분 a→b 가 사각형(경계 포함)과 겹치는지 (Liang–Barsky 클리핑).</summary>
-        public bool IntersectsSegment(Vector2 a, Vector2 b)
+        public bool IntersectsSegment(Vector2 a, Vector2 b) => SegmentEntry(a, b, out _);
+
+        /// <summary>
+        /// 선분 a→b 가 사각형에 처음 들어가는 비율 t (0~1). 겹치지 않으면 false.
+        /// a 가 이미 안에 있으면 t = 0.
+        /// </summary>
+        public bool SegmentEntry(Vector2 a, Vector2 b, out float t)
         {
             var d = b - a;
             var t0 = 0f;
             var t1 = 1f;
-            return Clip(-d.X, a.X - Min.X, ref t0, ref t1)
+            var hit = Clip(-d.X, a.X - Min.X, ref t0, ref t1)
                 && Clip(d.X, Max.X - a.X, ref t0, ref t1)
                 && Clip(-d.Y, a.Y - Min.Y, ref t0, ref t1)
                 && Clip(d.Y, Max.Y - a.Y, ref t0, ref t1);
+            t = t0;
+            return hit;
         }
 
         /// <summary>중심 <paramref name="c"/>, 반지름 <paramref name="r"/> 원의 경계 상자와 겹치는지 (빠른 걸러내기).</summary>

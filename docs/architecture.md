@@ -28,12 +28,14 @@
 | `Shared/Runtime/Interpolation` | 조각 조립(`SnapshotAssembler`), 델타 복원(`SnapshotReceiver`), 보간(`SnapshotInterpolator`) | Protocol |
 | `Shared/Runtime/Map` | 맵 종류별 벽 사각형(`MapLayouts`), `WallRect` 기하 | 없음 |
 | `Shared/Runtime/Combat` | 유닛 종류·수치(`UnitArchetypes`), 경제 규칙(`EconomyRules`), 시야 격자(`VisionGrid`) | Map |
+| `Shared/Runtime/Abilities` | 능력 데이터·목록·종류별 보유(`AbilityDefinition`, `AbilityCatalog`) | Combat |
 | `Server/src/OpenRTS.Server/Net` | `GameServer`: 접속·세션·명령 수신·전송(팀별 필터·델타·대역폭 측정) | Simulation, Shared |
 | `Server/src/OpenRTS.Server/Simulation` | `World`(상태·Step·명령), `Formation`, `Scenarios`, `SpatialGrid` | Shared |
 | `.../Simulation/Navigation` | `NavGrid`: clearance 격자, A\*, 경로 단순화, 선분-벽 판정 | Shared.Map |
 | `.../Simulation/Avoidance` | `OrcaSolver`: RVO2 에서 가져온 ORCA (Apache-2.0, 머리말에 변경 기록) | 없음 |
 | `.../Simulation/Combat` | `CombatSystem`(엔진 층), `BattleAi`(행동 층), `UnitOrder` | World |
 | `.../Simulation/Economy` | `EconomySystem`: 자원·채집·건설·생산·기지 배치 | World |
+| `.../Simulation/Abilities` | `AbilitySystem`: 시전·전달·상태 효과·AI 사용, 스크립트 등록부 | World |
 | `Server/src/OpenRTS.Server/GameLoop.cs`, `Program.cs` | 고정 틱 루프, 명령줄 옵션 | — |
 | `Client/Assets/Scripts/Net` | `GameClient`: 접속, 지연·손실 흉내, 메시지 분배, 명령 전송 | Shared |
 | `Client/Assets/Scripts/View` | 그리기: 유닛·건물, 전투 연출, 안개, 유령, 벽 | Net |
@@ -55,7 +57,8 @@
 3. 전투 이벤트 모으기   World.Combat.Events (+ 이벤트 위치) → 대기 목록
 4. tick % 2 == 0        스냅샷 전송(팀별) + 전투 이벤트 전송(팀별 필터)       15Hz
 5. tick % 15 == 0       지표(SimStats) 전송 (Fog of War 면 팀별로 가림)         2Hz
-6. tick % 6 == 0        플레이어별 경제 상태(PlayerState) 전송                  5Hz
+   (스냅샷 주기에 능력 이벤트도 팀별 필터로 전송)
+6. tick % 6 == 0        플레이어별 상태(PlayerState: 자원·대기열·능력 재사용 대기) 5Hz
 ```
 
 ### 3.2 `World.Step` 순서
@@ -69,13 +72,15 @@ Combat.BeginTick       전투 유닛 공간 격자
 Ai.Update              행동 층: 전투 봇 명령 결정 (0.25초마다, 유닛별 시점 분산)
 Combat.UpdateUnits     엔진 층: 대상 확인·획득·리쉬·추적·선딜·타격/발사
 EconomySystem.Update   채집·건설·생산
+AbilitySystem.Update   재사용 대기·상태 효과 시간, 시전(접근·선딜·발동·정신 집중), 지연 범위
 UpdateWaypoints        보이는 다음 경유점으로 건너뛰기
-선호 속도 + ORCA       유닛·벽 회피 (정적 유닛 제외)
+선호 속도 + ORCA       유닛·벽 회피 (정적 유닛 제외, 돌진 중이면 회피 없이 직진), 유닛별 속도(둔화·기절)
 적분                   속도 제한, 위치 갱신, 맵 경계
 Separate × 2           남은 겹침 풀기 (회피 몫 비율로)
 PushOutOfWalls         벽·건물 발판에서 밀어내기 (최종 안전장치)
 UpdateArrival          도착·막힘 판정, 막힘 재경로 (A* 예산 안에서)
 Combat.UpdateProjectiles  이번 틱 위치로 명중 판정
+AbilitySystem.UpdateAfterMovement  돌진 도착, 능력 투사체 이동·명중
 사망 제거              체력 0 유닛 제거 (정적이면 길찾기 재구성 예약)
 UpdateBattle           Battle 승패, 재시작 타이머
 UpdateVision           팀별 시야 (전송 필터·명령 검증이 쓴다)
@@ -114,7 +119,8 @@ World.CaptureState ─▶ 팀마다: CanSee 로 거르고, 안 보이는 공격 
 | 내 팀·중립 유닛 | 항상 |
 | 적 유닛 | 그 팀 시야(벽 가림 포함) 안일 때만 (Fog of War 켬) |
 | 전투 이벤트 | 공격자나 대상 위치가 보일 때만, 안 보이는 쪽 ID 는 0 |
-| 자원·생산 대기열 | 그 플레이어만 |
+| 자원·생산 대기열·능력 재사용 대기 | 그 플레이어만 |
+| 능력 이벤트 | 시전자나 지점이 보일 때만, 안 보이는 ID 는 0 |
 | 지표 | 상대 팀 생존 수·사망·투사체 수는 `Unknown`. 겹침 지표는 디버그용으로 전체 기준 |
 | 설정 | 모두 |
 

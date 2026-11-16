@@ -70,7 +70,7 @@ public static class Scenarios
 
     /// <summary>
     /// Battle: 봇을 반씩 1팀(왼쪽 x=-30)·2팀(오른쪽 x=+30)에 격자로 놓는다.
-    /// 상대 쪽 앞줄 절반은 근접, 뒷줄 절반은 원거리.
+    /// 상대 쪽 앞줄 절반은 근접, 뒷줄 절반은 원거리, 20명당 영웅 하나(앞줄 가운데).
     /// </summary>
     public static IEnumerable<(Vector2 Position, byte Team, UnitKind Kind)> BattleLayout(SimSettings s)
     {
@@ -82,9 +82,15 @@ public static class Scenarios
             var facing = t == 0 ? 1f : -1f; // 상대 쪽 방향 (x)
             var center = new Vector2(-30f * facing, 0);
             var offsets = Block(perTeam[t], spacing).OrderByDescending(o => o.X * facing).ToList();
+
+            // 영웅: 20명당 하나 (6명 이상일 때 최소 하나). 앞줄 가운데 쪽에 둔다.
+            var heroes = offsets.Count >= 6 ? Math.Max(1, offsets.Count / 20) : 0;
+            var heroSlots = Enumerable.Range(0, Math.Min(offsets.Count, (int)MathF.Ceiling(MathF.Sqrt(offsets.Count))))
+                .OrderBy(i => MathF.Abs(offsets[i].Y)).Take(heroes).ToHashSet();
             for (var i = 0; i < offsets.Count; i++)
             {
-                var kind = i < (offsets.Count + 1) / 2 ? UnitKind.Melee : UnitKind.Ranged;
+                var kind = heroSlots.Contains(i) ? UnitKind.Hero
+                    : i < (offsets.Count + 1) / 2 ? UnitKind.Melee : UnitKind.Ranged;
                 yield return (center + offsets[i], team, kind);
             }
         }

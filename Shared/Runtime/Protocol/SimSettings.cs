@@ -87,6 +87,12 @@ namespace OpenRTS.Shared.Protocol
         /// </summary>
         public bool FogOfWar;
 
+        /// <summary>
+        /// 능력 선딜 지연 보상: 명령이 서버에 오기까지 걸린 시간(ClientTick 으로 잼)만큼 선딜을 줄인다.
+        /// 상한은 선딜의 절반, 최대 0.1초 (조작한 클라이언트가 선딜을 없애지 못하게).
+        /// </summary>
+        public bool LagCompensation;
+
         public static SimSettings Default => new SimSettings
         {
             BotCount = 3,
@@ -104,6 +110,7 @@ namespace OpenRTS.Shared.Protocol
             RepathWhenBlocked = true,
             DeltaSnapshots = true,
             FogOfWar = true,
+            LagCompensation = true,
         };
 
         /// <summary>허용 범위로 자른 값. 서버는 받은 값을 반드시 이걸 거쳐 적용한다.</summary>
@@ -149,6 +156,7 @@ namespace OpenRTS.Shared.Protocol
             w.WriteByte(RepathWhenBlocked ? (byte)1 : (byte)0);
             w.WriteByte(DeltaSnapshots ? (byte)1 : (byte)0);
             w.WriteByte(FogOfWar ? (byte)1 : (byte)0);
+            w.WriteByte(LagCompensation ? (byte)1 : (byte)0);
         }
 
         /// <summary>메시지 타입 바이트를 읽은 뒤 호출한다.</summary>
@@ -169,13 +177,15 @@ namespace OpenRTS.Shared.Protocol
             RepathWhenBlocked = r.ReadByte() != 0,
             DeltaSnapshots = r.ReadByte() != 0,
             FogOfWar = r.ReadByte() != 0,
+            LagCompensation = r.ReadByte() != 0,
         };
 
         public bool Equals(SimSettings o) =>
             BotCount == o.BotCount && Scenario == o.Scenario && Map == o.Map && PlayerUnits == o.PlayerUnits && UnitRadius.Equals(o.UnitRadius) &&
             UnitSpeed.Equals(o.UnitSpeed) && Avoidance == o.Avoidance && NeighborDist.Equals(o.NeighborDist) &&
             MaxNeighbors == o.MaxNeighbors && TimeHorizon.Equals(o.TimeHorizon) && StopWhenBlocked == o.StopWhenBlocked &&
-            Separation == o.Separation && RepathWhenBlocked == o.RepathWhenBlocked && DeltaSnapshots == o.DeltaSnapshots && FogOfWar == o.FogOfWar;
+            Separation == o.Separation && RepathWhenBlocked == o.RepathWhenBlocked && DeltaSnapshots == o.DeltaSnapshots && FogOfWar == o.FogOfWar &&
+            LagCompensation == o.LagCompensation;
 
         public override bool Equals(object obj) => obj is SimSettings o && Equals(o);
 
@@ -184,7 +194,7 @@ namespace OpenRTS.Shared.Protocol
         public override string ToString() =>
             $"map {Map}, bots {BotCount} {Scenario}, player units {PlayerUnits}, r {UnitRadius:0.##}, speed {UnitSpeed:0.##}, avoidance {(Avoidance ? "on" : "off")} " +
             $"(neighborDist {NeighborDist:0.#}, maxNeighbors {MaxNeighbors}, horizon {TimeHorizon:0.##}), " +
-            $"separation {(Separation ? "on" : "off")}, stopWhenBlocked {StopWhenBlocked}, repath {RepathWhenBlocked}, delta {DeltaSnapshots}, fog {FogOfWar}";
+            $"separation {(Separation ? "on" : "off")}, stopWhenBlocked {StopWhenBlocked}, repath {RepathWhenBlocked}, delta {DeltaSnapshots}, fog {FogOfWar}, lagComp {LagCompensation}";
 
 
         private static float Clamp(float v, float min, float max) => float.IsNaN(v) ? min : Math.Max(min, Math.Min(v, max));

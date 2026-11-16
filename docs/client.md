@@ -14,6 +14,8 @@ Unity 6000.6.0f1, Built-in 렌더 파이프라인, 옛 Input Manager(`activeInpu
 | `MapView` | View | 설정의 맵 종류로 벽 상자 생성 |
 | `UnitViewManager` | View | 보간 위치로 유닛·건물·광맥 그리기 |
 | `CombatEffects` | View | 투사체·타격·사망 연출 |
+| `AbilityEffects` | View | 능력 연출 (투사체·범위 예고·폭발·적중) |
+| `CastPrediction` | Controls | 시전 즉시 표시: 자세·시전 막대·조준 표시·재사용 대기 예측, 확인·거부 처리 (abilities.md 9.1) |
 | `FogOfWarView` | View | 안개 막 |
 | `GhostView` | View | 안개 속 마지막 위치 표시 |
 | `RtsInput` | Controls | 선택·명령·건설 배치·카메라 |
@@ -35,9 +37,10 @@ Unity 6000.6.0f1, Built-in 렌더 파이프라인, 옛 Input Manager(`activeInpu
   | SimSettings | `Settings`, `SettingsChanged` 이벤트 |
   | SimStats | `Stats` |
   | CombatEvents | 대기 목록 → 렌더 시각이 되면 `DueCombatEvents` 로 |
-  | PlayerState | `Ore`, `Queues` |
+  | AbilityEvents | 같은 방식으로 `DueAbilityEvents` |
+  | PlayerState | `Ore`, `Queues`, `Cooldowns`(그 사이 로컬로 줄임) |
 
-- 명령: `SendCommand(type, unitIds, target, targetUnit[, kind])`. 지금 추정한 서버 틱(`ServerClock / TickDelta`)을 `ClientTick` 으로 싣고, 255개씩 나눠 보냅니다.
+- 명령: `SendCommand(type, unitIds, target, targetUnit[, kind])`, 능력은 `SendCast(unitIds, ability, point, targetUnit)`. 지금 추정한 서버 틱(`ServerClock / TickDelta`)을 `ClientTick` 으로 싣고, 255개씩 나눠 보냅니다.
 - 상태 조회 도우미: `IsMine(id)`, `IsEnemy(id)`(중립·같은 팀 제외).
 
 ## 3. 보간 (`SnapshotInterpolator`, Shared)
@@ -56,7 +59,8 @@ Unity 6000.6.0f1, Built-in 렌더 파이프라인, 옛 Input Manager(`activeInpu
 - 좌표: 서버 (x, y) → Unity (x, 0, y) (`ToWorld`).
 - 움직이는 유닛: 루트 크기 = 지름(2r), 몸은 캡슐. 근접은 짧은 네모 코, 원거리는 긴 총신, 일꾼은 작은 몸·짧은 도구(자원을 들면 등 위 수정). 공격 대상이 있으면 그쪽, 아니면 진행 방향을 봅니다.
 - 정적 유닛: 루트 크기 1, 몸 상자를 발판 크기로. 건설 중이면 진행도만큼 낮게, 광맥은 남은 양만큼 작게.
-- 색은 **내 팀 기준**: 내 것 초록, 같은 팀 파랑, 적 빨강, 중립 회색, 광맥 하늘색. 맞으면 0.12초 하얗게(`Flash`), 선딜 중이면 코가 노랗게.
+- 색은 **내 팀 기준**: 내 것 초록, 같은 팀 파랑, 적 빨강, 중립 회색, 광맥 하늘색. 맞으면 0.12초 하얗게(`Flash`), 공격 선딜 중이면 코가 노랗게, 능력 시전 중이면 보라.
+- 상태: 기절 = 머리 위 도는 노란 상자, 보호막 = 하늘색 고리, 둔화 = 몸이 푸르스름. 영웅은 머리 위 금색 관.
 - 체력 막대: 전투 팀 유닛만, 항상 카메라를 향함.
 - ID 가 재사용되거나 소유자·팀·종류가 바뀌면 뷰를 새로 만듭니다.
 - F1: 보간 전 최신 스냅샷 위치(노란 구).
@@ -87,8 +91,9 @@ Unity 6000.6.0f1, Built-in 렌더 파이프라인, 옛 Input Manager(`activeInpu
 | 우클릭 | 적 → Attack, 광맥·짓다 만 내 건물 → Gather, 땅 → Move. Ctrl → AttackMove |
 | H | Stop |
 | B | 병영 배치 모드: 0.5 칸 맞춤 미리보기(초록·빨강), 좌클릭 놓기(Shift 유지), 우클릭·Esc 취소 |
-| Z / X | 선택한 본진 → 일꾼, 병영 → 근접 / 원거리 |
-| WASD·화살표, 휠 | 카메라 |
+| Z / X / C | 선택한 본진 → 일꾼(Z)·영웅(C), 병영 → 근접(Z) / 원거리(X) |
+| Q W E R D F | 선택한 유닛의 능력 (abilities.md 8절). 대상이 있으면 대상 고르기 모드 |
+| 화살표, 휠 | 카메라 (WASD 는 능력 키와 겹쳐 쓰지 않음) |
 
 - 처음 내 유닛이 보이면 전부 선택합니다.
 - 디버그 창·명령 패널 위의 클릭은 선택으로 치지 않습니다: 각 창이 `Area`(GUI 좌표)를 공개하고, `IsOverDebugWindow` 가 이를 확인합니다. **새 GUI 창을 만들면 여기에 추가**하세요.

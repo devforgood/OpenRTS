@@ -29,6 +29,12 @@ namespace OpenRTS.Client.View
 
         public GameClient Client;
         public UnitSelection Selection;
+
+        /// <summary>시전 즉시 표시 (있으면 예측 중인 유닛을 시전 자세로 그린다).</summary>
+        public CastPrediction Prediction;
+
+        /// <summary>지금 이 유닛을 시전 자세로 그리고 있는지 (자동 확인용).</summary>
+        public bool IsShowingCast(int unitId) => _views.TryGetValue(unitId, out var v) && v.NoseState == 2;
         public Camera Camera;
 
         [Tooltip("보간 전 최신 스냅샷 위치를 반투명 구로 함께 표시 (F1).")]
@@ -49,10 +55,13 @@ namespace OpenRTS.Client.View
             public UnitKind Kind;
             public Color Color;
             public float FlashUntil;
-            public bool Windup;
+            public int NoseState;
             public bool IsStatic;
             public float Footprint;
             public GameObject Carry;
+            public GameObject StunMark;
+            public GameObject ShieldMark;
+            public UnitFlags AppliedStatus;
             public float AppliedHeight = -1f;
         }
 
@@ -162,6 +171,11 @@ namespace OpenRTS.Client.View
         private void UpdateLook(View view, in UnitState state, Quaternion cameraRotation)
         {
             var color = ColorFor(state);
+            if ((state.Flags & UnitFlags.Slowed) != 0)
+            {
+                color = Color.Lerp(color, SlowTint, 0.45f); // 둔화: 푸르스름하게
+            }
+
             var flashing = Time.time < view.FlashUntil;
             var body = flashing ? Color.white : color;
             if (view.Color != body)
@@ -170,11 +184,27 @@ namespace OpenRTS.Client.View
                 view.BodyRenderer.material.color = body;
             }
 
-            var windup = (state.Flags & UnitFlags.WindingUp) != 0;
-            if (view.Windup != windup)
+            // 코 색: 공격 선딜 노랑, 능력 시전(선딜·정신 집중·돌진) 보라.
+            // 내가 방금 시전한 유닛은 서버 확인 전에도 보라 (CastPrediction — 지연을 감추는 즉시 표시).
+            var casting = (state.Flags & UnitFlags.Casting) != 0 || (Prediction != null && Prediction.IsPredicting(state.Id));
+            var nose = casting ? 2 : (state.Flags & UnitFlags.WindingUp) != 0 ? 1 : 0;
+            if (view.NoseState != nose)
             {
-                view.Windup = windup;
-                view.NoseRenderer.material.color = windup ? WindupColor : NoseColor;
+                view.NoseState = nose;
+                view.NoseRenderer.material.color = nose == 2 ? CastColor : nose == 1 ? WindupColor : NoseColor;
+            }
+
+            var status = state.Flags & (UnitFlags.Stunned | UnitFlags.Shielded | UnitFlags.Casting);
+            if (status != view.AppliedStatus)
+            {
+                view.AppliedStatus = status;
+                view.StunMark?.SetActive((status & UnitFlags.Stunned) != 0);
+                view.ShieldMark?.SetActive((status & UnitFlags.Shielded) != 0);
+            }
+
+            if (view.StunMark != null && view.StunMark.activeSelf)
+            {
+                view.StunMark.transform.Rotate(0, 360f * Time.deltaTime, 0, Space.World); // 빙글빙글
             }
 
             if (view.Ring != null)
@@ -286,6 +316,8 @@ namespace OpenRTS.Client.View
         }
 
         private static readonly Color OreColor = new Color(0.3f, 0.85f, 0.95f);
+        private static readonly Color SlowTint = new Color(0.35f, 0.55f, 1f);
+        private static readonly Color CastColor = new Color(0.85f, 0.35f, 1f);
 
         /// <summary>건물(정육면체, 발판 크기) · 광맥(45도 돌린 수정). 루트는 크기 1 이고 몸체를 직접 키운다.</summary>
         private View CreateStatic(int id, in UnitState state)
@@ -424,6 +456,30 @@ namespace OpenRTS.Client.View
                 carry.SetActive(false);
                 view.Carry = carry;
             }
+
+            if (state.Kind == UnitKind.Hero)
+            {
+                // 영웅 표시: 머리 위 금색 관
+                var crown = CreatePrimitive(PrimitiveType.Cube, "Crown", new Color(1f, 0.8f, 0.2f), false);
+                crown.transform.SetParent(body.transform, false);
+                crown.transform.localPosition = new Vector3(0, 1.1f, 0);
+                crown.transform.localScale = new Vector3(0.6f, 0.15f, 0.6f);
+            }
+
+            // 상태 표시: 기절(머리 위 도는 노란 상자), 보호막(몸을 두른 하늘색 고리)
+            var stun = CreatePrimitive(PrimitiveType.Cube, "Stunned", new Color(1f, 0.95f, 0.3f), false);
+            stun.transform.SetParent(root, false);
+            stun.transform.localPosition = new Vector3(0, 1.75f, 0);
+            stun.transform.localScale = new Vector3(0.35f, 0.12f, 0.35f);
+            stun.SetActive(false);
+            view.StunMark = stun;
+
+            var shield = CreatePrimitive(PrimitiveType.Cylinder, "Shield", new Color(0.45f, 0.9f, 1f), false);
+            shield.transform.SetParent(root, false);
+            shield.transform.localPosition = new Vector3(0, -0.2f, 0);
+            shield.transform.localScale = new Vector3(1.5f, 0.02f, 1.5f);
+            shield.SetActive(false);
+            view.ShieldMark = shield;
 
             if (state.Team != UnitArchetypes.NeutralTeam)
             {

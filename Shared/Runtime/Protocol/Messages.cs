@@ -38,8 +38,11 @@ namespace OpenRTS.Shared.Protocol
         /// <summary>S→C 전투 이벤트 (타격·발사·사망 연출용). (unreliable)</summary>
         CombatEvents = 10,
 
-        /// <summary>S→C 이 플레이어의 자원과 생산 대기열. (unreliable, 5Hz)</summary>
+        /// <summary>S→C 이 플레이어의 자원·생산 대기열·능력 재사용 대기. (unreliable, 5Hz)</summary>
         PlayerState = 11,
+
+        /// <summary>S→C 능력 연출 이벤트 (시전·투사체·범위·돌진·적중). (unreliable)</summary>
+        AbilityEvents = 12,
     }
 
     public struct ClientHello
@@ -103,6 +106,9 @@ namespace OpenRTS.Shared.Protocol
 
         /// <summary>건물: Kind 유닛을 생산 대기열에 넣는다 (비용은 넣을 때 낸다).</summary>
         Train = 6,
+
+        /// <summary>능력 사용: Ability 를 TargetUnit(유닛 대상) 또는 Target(지점)에. 사거리 밖이면 걸어가서 쓴다.</summary>
+        Cast = 7,
     }
 
     /// <summary>선택한 내 유닛들에게 내리는 명령. 서버가 소유권을 확인하고, 이동이면 대형을 짠다.</summary>
@@ -124,6 +130,9 @@ namespace OpenRTS.Shared.Protocol
         /// <summary>Build·Train 에서 지을/만들 종류.</summary>
         public Combat.UnitKind Kind;
 
+        /// <summary>Cast 에서 쓸 능력.</summary>
+        public Abilities.AbilityId Ability;
+
         public IReadOnlyList<int> UnitIds;
 
         public void Write(PacketWriter w)
@@ -137,6 +146,7 @@ namespace OpenRTS.Shared.Protocol
             w.WriteUShort((ushort)TargetUnit);
             w.WriteUInt(ClientTick);
             w.WriteByte((byte)Kind);
+            w.WriteByte((byte)Ability);
             w.WriteByte((byte)count);
             for (var i = 0; i < count; i++)
             {
@@ -153,6 +163,7 @@ namespace OpenRTS.Shared.Protocol
                 TargetUnit = r.ReadUShort(),
                 ClientTick = r.ReadUInt(),
                 Kind = (Combat.UnitKind)r.ReadByte(),
+                Ability = (Abilities.AbilityId)r.ReadByte(),
             };
             if (!Enum.IsDefined(typeof(CommandType), cmd.Type))
             {
@@ -183,6 +194,16 @@ namespace OpenRTS.Shared.Protocol
         Death = 2,
     }
 
+    /// <summary>재사용 대기 중인 능력 하나 (내 유닛별).</summary>
+    public struct AbilityCooldown
+    {
+        public int UnitId;
+        public Abilities.AbilityId Ability;
+
+        /// <summary>남은 시간(초, 0.1초 단위로 보냄).</summary>
+        public float Remaining;
+    }
+
     /// <summary>생산 대기열 하나 (건물별).</summary>
     public struct ProductionQueue
     {
@@ -196,13 +217,19 @@ namespace OpenRTS.Shared.Protocol
     }
 
     /// <summary>
-    /// S→C 이 플레이어만의 경제 상태: 가진 자원과 내 건물들의 생산 대기열 (5Hz, unreliable — 다음 것이 덮어쓴다).
-    /// 남의 자원·대기열은 보내지 않는다.
+    /// S→C 이 플레이어만의 상태: 가진 자원, 내 건물들의 생산 대기열, 내 유닛의 능력 재사용 대기
+    /// (5Hz, unreliable — 다음 것이 덮어쓴다). 남의 것은 보내지 않는다.
     /// </summary>
     public struct PlayerStateMessage
     {
+        /// <summary>한 메시지에 담는 최대 재사용 대기 항목 수 (패킷 크기 한도).</summary>
+        public const int MaxCooldowns = 150;
+
         public int Ore;
         public List<ProductionQueue> Queues;
+
+        /// <summary>대기 중인 능력만 (준비된 능력은 없음).</summary>
+        public List<AbilityCooldown> Cooldowns;
 
         public void Write(PacketWriter w)
         {
@@ -224,6 +251,17 @@ namespace OpenRTS.Shared.Protocol
 
                 w.WriteByte((byte)Math.Round(Math.Max(0, Math.Min(1, q.Progress)) * 255));
             }
+
+            var cooldowns = Cooldowns ?? new List<AbilityCooldown>();
+            var cdCount = Math.Min(cooldowns.Count, MaxCooldowns);
+            w.WriteByte((byte)cdCount);
+            for (var i = 0; i < cdCount; i++)
+            {
+                var c = cooldowns[i];
+                w.WriteUShort((ushort)c.UnitId);
+                w.WriteByte((byte)c.Ability);
+                w.WriteUShort((ushort)Math.Min(ushort.MaxValue, Math.Ceiling(Math.Max(0, c.Remaining) * 10)));
+            }
         }
 
         public static PlayerStateMessage Read(ref PacketReader r)
@@ -243,7 +281,104 @@ namespace OpenRTS.Shared.Protocol
                 msg.Queues.Add(q);
             }
 
+            msg.Cooldowns = new List<AbilityCooldown>();
+            int cdCount = r.ReadByte();
+            for (var i = 0; i < cdCount; i++)
+            {
+                msg.Cooldowns.Add(new AbilityCooldown
+                {
+                    UnitId = r.ReadUShort(),
+                    Ability = (Abilities.AbilityId)r.ReadByte(),
+                    Remaining = r.ReadUShort() / 10f,
+                });
+            }
+
             return msg;
+        }
+    }
+
+    public enum AbilityEventType : byte
+    {
+        /// <summary>시전 시작 (선딜). Point = 대상 지점.</summary>
+        CastStart = 0,
+
+        /// <summary>시전 취소 (기절·사망·다른 명령·대상 상실).</summary>
+        CastCancel = 1,
+
+        /// <summary>직선 투사체 발사. Point = 날아갈 끝 지점(사거리 끝).</summary>
+        ProjectileLaunch = 2,
+
+        /// <summary>투사체 끝 (맞음·벽·사거리). Point = 끝난 위치.</summary>
+        ProjectileEnd = 3,
+
+        /// <summary>범위 예고 (지연이 있는 범위). Point = 중심.</summary>
+        AreaTelegraph = 4,
+
+        /// <summary>범위 발동. Point = 중심.</summary>
+        AreaHit = 5,
+
+        /// <summary>돌진 시작. Point = 도착 지점.</summary>
+        DashStart = 6,
+
+        /// <summary>정신 집중 시작.</summary>
+        ChannelStart = 7,
+
+        /// <summary>효과가 유닛에 들어감 (Target = 맞은 유닛).</summary>
+        Hit = 8,
+    }
+
+    public struct AbilityEvent
+    {
+        public uint Tick;
+        public AbilityEventType Type;
+        public int Caster;
+        public Abilities.AbilityId Ability;
+        public int Target;
+        public Vector2 Point;
+    }
+
+    /// <summary>
+    /// S→C 능력 연출 이벤트 (스냅샷과 같은 주기, unreliable). 체력·상태는 스냅샷이 권위이고 이것은 보이기 위한 것.
+    /// 팀마다 시전자·대상·지점 중 하나가 보일 때만 보내고, 안 보이는 유닛 ID 는 0 으로 가린다.
+    /// </summary>
+    public static class AbilityEventsMessage
+    {
+        /// <summary>패킷 하나에 담는 최대 이벤트 수 (헤더 3 + 이벤트당 14바이트).</summary>
+        public const int MaxPerPacket = 70;
+
+        public static void Write(PacketWriter w, IReadOnlyList<AbilityEvent> events, int start, int count)
+        {
+            w.WriteByte((byte)MessageType.AbilityEvents);
+            w.WriteUShort((ushort)count);
+            for (var i = start; i < start + count; i++)
+            {
+                var e = events[i];
+                w.WriteUInt(e.Tick);
+                w.WriteByte((byte)e.Type);
+                w.WriteUShort((ushort)e.Caster);
+                w.WriteByte((byte)e.Ability);
+                w.WriteUShort((ushort)e.Target);
+                w.WriteShort(SnapshotMessage.Quantize(e.Point.X));
+                w.WriteShort(SnapshotMessage.Quantize(e.Point.Y));
+            }
+        }
+
+        public static void Read(ref PacketReader r, List<AbilityEvent> output)
+        {
+            output.Clear();
+            int count = r.ReadUShort();
+            for (var i = 0; i < count; i++)
+            {
+                output.Add(new AbilityEvent
+                {
+                    Tick = r.ReadUInt(),
+                    Type = (AbilityEventType)r.ReadByte(),
+                    Caster = r.ReadUShort(),
+                    Ability = (Abilities.AbilityId)r.ReadByte(),
+                    Target = r.ReadUShort(),
+                    Point = new Vector2(SnapshotMessage.Dequantize(r.ReadShort()), SnapshotMessage.Dequantize(r.ReadShort())),
+                });
+            }
         }
     }
 
@@ -325,6 +460,18 @@ namespace OpenRTS.Shared.Protocol
 
         /// <summary>건물이 생산 중.</summary>
         Producing = 8,
+
+        /// <summary>기절.</summary>
+        Stunned = 16,
+
+        /// <summary>능력 시전 중 (선딜·정신 집중·돌진).</summary>
+        Casting = 32,
+
+        /// <summary>둔화.</summary>
+        Slowed = 64,
+
+        /// <summary>보호막이 있음.</summary>
+        Shielded = 128,
     }
 
     /// <summary>클라이언트가 복원한 유닛 상태 한 개.</summary>

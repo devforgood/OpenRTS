@@ -254,9 +254,9 @@ public sealed class EconomySystem
         _scratch.AddRange(_world.Units); // 생산으로 유닛이 늘어나므로 복사본을 돈다
         foreach (var u in _scratch)
         {
-            if (u.IsDead)
+            if (u.IsDead || u.IsStunned)
             {
-                continue;
+                continue; // 기절한 일꾼·건물은 일을 멈춘다
             }
 
             if (u.Kind == UnitKind.Worker)

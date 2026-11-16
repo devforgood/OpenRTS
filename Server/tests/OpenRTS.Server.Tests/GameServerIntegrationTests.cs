@@ -265,6 +265,56 @@ public sealed class GameServerIntegrationTests : IDisposable
         Assert.True((a.LastSnapshot[hq.Id].Flags & UnitFlags.Producing) == 0);
     }
 
+    [Fact]
+    public void HeroAbility_OverNetwork_EventsAndOwnerOnlyCooldowns()
+    {
+        using var a = new TestClient(_server.Port);
+        using var b = new TestClient(_server.Port);
+        RunUntil(() => a.MyUnits().Count == PlayerUnits && b.MyUnits().Count == PlayerUnits, a, b);
+        var hero = a.LastSnapshot.Values.Single(u => u.Owner == a.Welcome!.Value.PlayerId && u.Kind == OpenRTS.Shared.Combat.UnitKind.Hero);
+
+        a.SendCommand(new UnitCommand { Type = CommandType.Cast, Ability = OpenRTS.Shared.Abilities.AbilityId.Nova, UnitIds = new[] { hero.Id } });
+        RunUntil(() => a.AbilityEvents.Any(e => e.Type == AbilityEventType.AreaHit && e.Caster == hero.Id), a, b);
+        Assert.Contains(a.AbilityEvents, e => e.Type == AbilityEventType.CastStart && e.Ability == OpenRTS.Shared.Abilities.AbilityId.Nova);
+
+        RunUntil(() => a.PlayerState is { } s && s.Cooldowns.Any(c => c.UnitId == hero.Id && c.Ability == OpenRTS.Shared.Abilities.AbilityId.Nova), a, b);
+        Assert.True(b.PlayerState is { } bs && bs.Cooldowns.All(c => c.UnitId != hero.Id)); // 남의 재사용 대기는 안 온다
+    }
+
+    /// <summary>
+    /// 지연 보상: 같은 시전을 ClientTick = 0(모름 → 보상 없음)과 9틱 전(0.3초 이상 지연)으로 보내면,
+    /// 뒤의 것은 시전 시작(CastStart)부터 발사까지가 상한(0.1초 = 3틱)만큼 짧다.
+    /// </summary>
+    [Fact]
+    public void CastCommand_WithOldClientTick_IsCompensatedOverNetwork()
+    {
+        using var a = new TestClient(_server.Port);
+        RunUntil(() => a.MyUnits().Count == PlayerUnits && a.Settings is not null, a);
+        var hero = a.LastSnapshot.Values.Single(u => u.Owner == a.Welcome!.Value.PlayerId && u.Kind == OpenRTS.Shared.Combat.UnitKind.Hero);
+
+        int WindupTicks(uint? ticksAgo)
+        {
+            a.AbilityEvents.Clear();
+            a.SendCommand(new UnitCommand
+            {
+                Type = CommandType.Cast,
+                Ability = OpenRTS.Shared.Abilities.AbilityId.ShockBolt,
+                Target = hero.Position + new Vector2(10, 0),
+                ClientTick = ticksAgo is { } ago ? _server.CurrentTick - ago : 0,
+                UnitIds = new[] { hero.Id },
+            });
+            RunUntil(() => a.AbilityEvents.Any(e => e.Type == AbilityEventType.ProjectileLaunch && e.Caster == hero.Id), a);
+            var start = a.AbilityEvents.First(e => e.Type == AbilityEventType.CastStart && e.Caster == hero.Id).Tick;
+            var launch = a.AbilityEvents.First(e => e.Type == AbilityEventType.ProjectileLaunch && e.Caster == hero.Id).Tick;
+            return (int)(launch - start);
+        }
+
+        var fresh = WindupTicks(null);
+        RunUntil(() => _server.World.Find(hero.Id)!.FindAbility(OpenRTS.Shared.Abilities.AbilityId.ShockBolt)!.IsReady, a);
+        var late = WindupTicks(9);
+        Assert.Equal(fresh - 3, late);
+    }
+
     private void AssertClientMatchesServer(TestClient client)
     {
         // 클라이언트가 마지막으로 복원한 틱에 서버가 실제로 보낸 상태와 비교한다.
@@ -334,6 +384,11 @@ public sealed class GameServerIntegrationTests : IDisposable
                     case MessageType.PlayerState:
                         PlayerState = PlayerStateMessage.Read(ref r);
                         break;
+                    case MessageType.AbilityEvents:
+                        var abilityBatch = new List<AbilityEvent>();
+                        AbilityEventsMessage.Read(ref r, abilityBatch);
+                        AbilityEvents.AddRange(abilityBatch);
+                        break;
                     case MessageType.CombatEvents:
                         var batch = new List<CombatEvent>();
                         CombatEventsMessage.Read(ref r, batch);
@@ -371,6 +426,7 @@ public sealed class GameServerIntegrationTests : IDisposable
 
         public List<CombatEvent> Events { get; } = new();
         public PlayerStateMessage? PlayerState { get; private set; }
+        public List<AbilityEvent> AbilityEvents { get; } = new();
 
         public void SendCommand(UnitCommand command)
         {

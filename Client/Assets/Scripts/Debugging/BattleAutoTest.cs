@@ -1,4 +1,5 @@
 using System;
+using System.Linq;
 using OpenRTS.Client.Net;
 using OpenRTS.Client.View;
 using OpenRTS.Shared.Map;
@@ -21,6 +22,10 @@ namespace OpenRTS.Client.Debugging
         public UnitViewManager Views;
         public CombatEffects Effects;
         public FogOfWarView Fog;
+        public AbilityEffects AbilityEffects;
+        private bool _castSent;
+        private bool _castConfirmed;
+        private bool _heroHadChance;
         private int _enemiesSeenAtStart = -1;
         private int _maxFogVisibleCells;
 
@@ -117,6 +122,7 @@ namespace OpenRTS.Client.Debugging
             }
 
             _maxFogVisibleCells = Math.Max(_maxFogVisibleCells, Fog != null ? Fog.VisibleCells : 0);
+            TryHeroCast();
             _maxProjectiles = Math.Max(_maxProjectiles, Effects.ActiveProjectiles);
             _maxUnits = Math.Max(_maxUnits, Views.InterpolatedPositions.Count);
             _maxStepMs = Math.Max(_maxStepMs, stats.StepMs);
@@ -158,14 +164,55 @@ namespace OpenRTS.Client.Debugging
             }
 
             var fogOk = !applied.FogOfWar || (_enemiesSeenAtStart == 0 && _maxFogVisibleCells > 0);
-            var ok = loserVisible == 0 && winnerVisible > 0 && Client.CombatEventsReceived > 0 && _maxProjectiles > 0 && _sawDamage && fogOk;
+            var abilityOk = Client.AbilityEventsReceived > 0 && (_castConfirmed || !_heroHadChance);
+            // 안개가 켜져 있고 내 팀이 졌으면 내 시야가 없으므로 이긴 팀도 보이지 않는 게 맞다.
+            var winnerOk = winnerVisible > 0 || (applied.FogOfWar && stats.Winner != Client.MyTeam);
+            var ok = loserVisible == 0 && winnerOk && Client.CombatEventsReceived > 0 && _maxProjectiles > 0 && _sawDamage && fogOk && abilityOk;
             Finish(ok,
                 $"{_map} battle {_bots} bots: team {stats.Winner} won after {_winnerSeen - _battleStart:0.0}s, " +
                 $"visible winner {winnerVisible} / loser {loserVisible}, deaths {(stats.Deaths == SimStats.Unknown ? "?" : stats.Deaths.ToString())}, " +
                 $"combat events {Client.CombatEventsReceived}, max projectiles on screen {_maxProjectiles}, damage seen {_sawDamage}, " +
                 $"max units {_maxUnits}, max server step {_maxStepMs:0.00} ms, snapshots {Client.SnapshotsReceived} (delta {Client.DeltaSnapshotsReceived}), " +
                 $"no baseline {Client.SnapshotsMissingBaseline}, bandwidth {stats.SnapshotBytesPerSec / 1024f:0.0} KB/s, my team {Client.MyTeam}, " +
-                $"fog {applied.FogOfWar} (enemies at start {_enemiesSeenAtStart}, max visible cells {_maxFogVisibleCells})");
+                $"fog {applied.FogOfWar} (enemies at start {_enemiesSeenAtStart}, max visible cells {_maxFogVisibleCells}), " +
+                $"ability events {Client.AbilityEventsReceived} (drawn {AbilityEffects?.Played ?? 0}), my hero cast {(_castConfirmed ? "confirmed" : _heroHadChance ? "NOT confirmed" : "no chance")}");
+        }
+
+        /// <summary>
+        /// 내 영웅이 살아 있고 12 안에 보이는 적이 있으면 Shock Bolt 를 한 번 쏘고,
+        /// 서버가 보낸 재사용 대기(PlayerState)로 실제로 쓰였는지 확인한다.
+        /// </summary>
+        private void TryHeroCast()
+        {
+            var hero = Client.Latest.Values.FirstOrDefault(u => u.Owner == Client.PlayerId && u.Kind == OpenRTS.Shared.Combat.UnitKind.Hero);
+            if (hero.Id == 0)
+            {
+                return;
+            }
+
+            if (_castSent)
+            {
+                if (Client.CooldownOf(hero.Id, OpenRTS.Shared.Abilities.AbilityId.ShockBolt) > 0)
+                {
+                    _castConfirmed = true;
+                }
+
+                return;
+            }
+
+            var enemy = Client.Latest.Values
+                .Where(u => Client.IsEnemy(u.Id) && System.Numerics.Vector2.Distance(u.Position, hero.Position) < 12f)
+                .OrderBy(u => System.Numerics.Vector2.Distance(u.Position, hero.Position))
+                .FirstOrDefault();
+            if (enemy.Id == 0)
+            {
+                return;
+            }
+
+            _heroHadChance = true;
+            Client.SendCast(new[] { hero.Id }, OpenRTS.Shared.Abilities.AbilityId.ShockBolt, enemy.Position, 0);
+            _castSent = true;
+            Debug.Log($"[AUTOTEST] hero {hero.Id} casts Shock Bolt at enemy {enemy.Id}");
 
         }
 

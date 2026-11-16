@@ -1,6 +1,7 @@
 using System.Collections.Generic;
 using OpenRTS.Client.Net;
 using OpenRTS.Client.View;
+using OpenRTS.Shared.Abilities;
 using OpenRTS.Shared.Combat;
 using OpenRTS.Shared.Protocol;
 using UnityEngine;
@@ -16,7 +17,8 @@ namespace OpenRTS.Client.Controls
     /// <item>Ctrl+우클릭: 공격 이동 (가면서 만나는 적과 싸움) / H: 정지</item>
     /// <item>Ctrl+1~9: 부대 지정, 1~9: 부대 선택</item>
     /// <item>우클릭 광맥: 일꾼 채집 / B: 병영 배치(좌클릭으로 놓기, Shift 로 여러 개) / Z·X: 선택한 건물에서 생산</item>
-    /// <item>WASD/화살표: 카메라 이동, 휠: 줌</item>
+    /// <item>Q W E R D F: 선택한 유닛의 능력 (대상이 있으면 좌클릭으로 고름, 우클릭·Esc 취소)</item>
+    /// <item>화살표: 카메라 이동, 휠: 줌</item>
     /// </list>
     /// </summary>
     public sealed class RtsInput : MonoBehaviour
@@ -60,6 +62,10 @@ namespace OpenRTS.Client.Controls
             {
                 UpdatePlacement();
             }
+            else if (Targeting.HasValue)
+            {
+                UpdateAbilityTargeting();
+            }
             else
             {
                 HandleSelection();
@@ -67,8 +73,9 @@ namespace OpenRTS.Client.Controls
 
             HandleGroups();
             HandleProductionKeys();
+            HandleAbilityKeys();
 
-            if (!Placing.HasValue && UnityEngine.Input.GetMouseButtonDown(1) && TryGetGroundPoint(UnityEngine.Input.mousePosition, out var point) && Selection.Count > 0)
+            if (!Placing.HasValue && !Targeting.HasValue && UnityEngine.Input.GetMouseButtonDown(1) && TryGetGroundPoint(UnityEngine.Input.mousePosition, out var point) && Selection.Count > 0)
             {
                 var ground = new Vector2(point.x, point.z);
                 var enemy = PickUnit(UnityEngine.Input.mousePosition, Client.IsEnemy);
@@ -101,7 +108,11 @@ namespace OpenRTS.Client.Controls
                 Client.SendCommand(CommandType.Stop, Selection.Ids, default, 0);
             }
 
-            var pan = new Vector3(UnityEngine.Input.GetAxisRaw("Horizontal"), 0, UnityEngine.Input.GetAxisRaw("Vertical"));
+            // 카메라는 화살표 키 (WASD 는 Q W E R D F 능력 키와 겹쳐서 쓰지 않는다)
+            var pan = new Vector3(
+                (UnityEngine.Input.GetKey(KeyCode.RightArrow) ? 1 : 0) - (UnityEngine.Input.GetKey(KeyCode.LeftArrow) ? 1 : 0),
+                0,
+                (UnityEngine.Input.GetKey(KeyCode.UpArrow) ? 1 : 0) - (UnityEngine.Input.GetKey(KeyCode.DownArrow) ? 1 : 0));
             Camera.transform.position += pan * (PanSpeed * Time.unscaledDeltaTime);
 
             var scroll = UnityEngine.Input.mouseScrollDelta.y;
@@ -285,6 +296,202 @@ namespace OpenRTS.Client.Controls
             return Debugging.NetDebugHud.Area.Contains(gui) || Debugging.SimSettingsPanel.Area.Contains(gui) || CommandPanel.Area.Contains(gui);
         }
 
+        // ── 능력 ──────────────────────────────────────────────
+
+        /// <summary>능력 단축키 순서. 선택한 유닛들의 능력 목록(<see cref="AvailableAbilities"/>) 순서대로 붙는다.</summary>
+        public static readonly KeyCode[] AbilityKeys = { KeyCode.Q, KeyCode.W, KeyCode.E, KeyCode.R, KeyCode.D, KeyCode.F };
+
+        /// <summary>대상을 고르는 중인 능력 (없으면 null). 좌클릭으로 쓰고, 우클릭·Esc 로 취소.</summary>
+        public AbilityId? Targeting { get; private set; }
+
+        private readonly List<AbilityId> _abilities = new List<AbilityId>();
+        private Transform _targetRing;
+        private Renderer _targetRenderer;
+
+        /// <summary>
+        /// 선택한 내 유닛들이 가진 능력 (영웅 먼저, 종류별 보유 순서, 중복 없이). 단축키는 이 순서로 Q W E R D F.
+        /// </summary>
+        public IReadOnlyList<AbilityId> AvailableAbilities()
+        {
+            _abilities.Clear();
+            var kinds = new List<UnitKind>();
+            foreach (var id in Selection.Ids)
+            {
+                if (Client.Latest.TryGetValue(id, out var s) && s.Owner == Client.PlayerId && !kinds.Contains(s.Kind))
+                {
+                    kinds.Add(s.Kind);
+                }
+            }
+
+            kinds.Sort((a, b) => (a == UnitKind.Hero ? 0 : 1 + (int)a).CompareTo(b == UnitKind.Hero ? 0 : 1 + (int)b));
+            foreach (var kind in kinds)
+            {
+                foreach (var ability in AbilityCatalog.LoadoutOf(kind))
+                {
+                    if (!_abilities.Contains(ability))
+                    {
+                        _abilities.Add(ability);
+                    }
+                }
+            }
+
+            return _abilities;
+        }
+
+        /// <summary>선택한 유닛 중 이 능력을 가진 유닛들의 가장 짧은 남은 재사용 대기 (하나라도 준비됐으면 0).</summary>
+        public float ReadyIn(AbilityId ability)
+        {
+            var best = float.MaxValue;
+            foreach (var id in Selection.Ids)
+            {
+                if (Client.Latest.TryGetValue(id, out var s) && Contains(AbilityCatalog.LoadoutOf(s.Kind), ability))
+                {
+                    best = Mathf.Min(best, Client.CooldownOf(id, ability));
+                }
+            }
+
+            return best == float.MaxValue ? 0 : best;
+        }
+
+        /// <summary>능력 사용: 대상이 없으면 바로, 있으면 대상 고르기 모드.</summary>
+        public void BeginAbility(AbilityId ability)
+        {
+            if (!AbilityCatalog.TryGet(ability, out var def) || ReadyIn(ability) > 0)
+            {
+                return;
+            }
+
+            CancelPlacement();
+            if (def.Targeting == AbilityTargeting.None)
+            {
+                Cast(ability, default, 0);
+                return;
+            }
+
+            Targeting = ability;
+            if (_targetRing == null)
+            {
+                var go = GameObject.CreatePrimitive(PrimitiveType.Cylinder);
+                go.name = "Ability Target";
+                Destroy(go.GetComponent<Collider>());
+                _targetRing = go.transform;
+                _targetRenderer = go.GetComponent<Renderer>();
+            }
+
+            var size = def.AreaRadius > 0 ? def.AreaRadius * 2 : 0.8f;
+            _targetRing.localScale = new Vector3(size, 0.02f, size);
+            _targetRenderer.material.color = new Color(0.35f, 0.8f, 1f);
+            _targetRing.gameObject.SetActive(true);
+        }
+
+        public void CancelAbility()
+        {
+            Targeting = null;
+            if (_targetRing != null)
+            {
+                _targetRing.gameObject.SetActive(false);
+            }
+        }
+
+        private void HandleAbilityKeys()
+        {
+            if (Ctrl())
+            {
+                return; // Ctrl+조합은 다른 기능
+            }
+
+            var abilities = AvailableAbilities();
+            for (var i = 0; i < AbilityKeys.Length && i < abilities.Count; i++)
+            {
+                if (UnityEngine.Input.GetKeyDown(AbilityKeys[i]))
+                {
+                    BeginAbility(abilities[i]);
+                }
+            }
+        }
+
+        private void UpdateAbilityTargeting()
+        {
+            var ability = Targeting!.Value;
+            var def = AbilityCatalog.Get(ability);
+            if (UnityEngine.Input.GetKeyDown(KeyCode.Escape) || UnityEngine.Input.GetMouseButtonDown(1) || ReadyIn(ability) > 0 || Selection.Count == 0)
+            {
+                CancelAbility();
+                return;
+            }
+
+            if (!TryGetGroundPoint(UnityEngine.Input.mousePosition, out var point))
+            {
+                return;
+            }
+
+            _targetRing.position = point + Vector3.up * 0.03f;
+            if (!UnityEngine.Input.GetMouseButtonDown(0) || IsOverDebugWindow(UnityEngine.Input.mousePosition))
+            {
+                return;
+            }
+
+            var ground = new Vector2(point.x, point.z);
+            if (def.Targeting == AbilityTargeting.Unit)
+            {
+                var wantsAllies = (def.Affects & AbilityAffects.Allies) != 0;
+                var target = PickUnit(UnityEngine.Input.mousePosition, id => wantsAllies ? IsFriendly(id) : Client.IsEnemy(id));
+                if (target < 0)
+                {
+                    return; // 대상이 아니면 계속 고른다
+                }
+
+                Cast(ability, ground, target);
+            }
+            else
+            {
+                Cast(ability, ground, 0);
+            }
+
+            ShowMarker(point, new Color(0.35f, 0.8f, 1f));
+            CancelAbility();
+        }
+
+        private bool IsFriendly(int id) => Client.Latest.TryGetValue(id, out var s) && s.Team != 0 && s.Team == Client.MyTeam;
+
+        /// <summary>시전 즉시 표시 (없으면 명령만 보낸다).</summary>
+        public CastPrediction Prediction;
+
+        /// <summary>시전 명령: 즉시 표시를 시작하며 보낸다.</summary>
+        private void Cast(AbilityId ability, Vector2 point, int target)
+        {
+            if (Prediction != null)
+            {
+                Prediction.Cast(Selection.Ids, ability, point, target);
+            }
+            else
+            {
+                Client.SendCast(Selection.Ids, ability, point, target);
+            }
+        }
+
+        /// <summary>
+        /// 자동 확인용: 지정한 유닛들로 입력과 같은 경로(즉시 표시 + 전송)로 시전한다.
+        /// <paramref name="force"/> 면 로컬 재사용 대기를 무시한다 (서버 거부 처리를 확인할 때).
+        /// </summary>
+        public void CastForTest(IReadOnlyList<int> units, AbilityId ability, Vector2 point, bool force)
+        {
+            Prediction.Cast(units, ability, point, 0, force);
+        }
+
+        private static bool Contains(IReadOnlyList<AbilityId> list, AbilityId id)
+        {
+            for (var i = 0; i < list.Count; i++)
+            {
+                if (list[i] == id)
+                {
+                    return true;
+                }
+            }
+
+            return false;
+        }
+
         // ── 경제: 건설 배치·생산 ──────────────────────────────
 
         private static readonly Color WorkMarkerColor = new Color(0.3f, 0.85f, 0.95f);
@@ -323,6 +530,7 @@ namespace OpenRTS.Client.Controls
                 return;
             }
 
+            CancelAbility();
             Placing = kind;
             if (_placementGhost == null)
             {
@@ -368,6 +576,11 @@ namespace OpenRTS.Client.Controls
             if (UnityEngine.Input.GetKeyDown(KeyCode.X) && SelectedCount(UnitKind.Barracks) > 0)
             {
                 Train(UnitKind.Ranged);
+            }
+
+            if (UnityEngine.Input.GetKeyDown(KeyCode.C) && SelectedCount(UnitKind.Headquarters) > 0)
+            {
+                Train(UnitKind.Hero);
             }
         }
 

@@ -63,7 +63,13 @@ public sealed class BattleAi
 
     private void Think(Unit u)
     {
-        if (u.Windup > 0)
+        if (u.Windup > 0 || u.Cast != null || u.IsStunned || u.IsDashing)
+        {
+            return;
+        }
+
+        // 능력: 데이터의 AI 힌트에 맞는 상황이면 먼저 쓴다 (싸우는 중에도).
+        if (_world.AbilitySystem.TryAiCast(u))
         {
             return;
         }

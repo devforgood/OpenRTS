@@ -40,6 +40,9 @@ public sealed class GameServer : IDisposable
     private readonly List<CombatEvent> _pendingEvents = new();
     private readonly List<(System.Numerics.Vector2 Attacker, System.Numerics.Vector2 Target)> _pendingEventPositions = new();
     private readonly List<CombatEvent> _visibleEvents = new();
+    private readonly List<AbilityEvent> _pendingAbilityEvents = new();
+    private readonly List<(System.Numerics.Vector2 Caster, System.Numerics.Vector2 Point)> _pendingAbilityPositions = new();
+    private readonly List<AbilityEvent> _visibleAbilityEvents = new();
     private float _commandDelayMs;
     private double _stepMsTotal;
     private int _stepSamples;
@@ -100,11 +103,15 @@ public sealed class GameServer : IDisposable
         _pendingEvents.AddRange(World.Combat.Events);
         _pendingEventPositions.AddRange(World.Combat.EventPositions);
         World.Combat.ClearEvents();
+        _pendingAbilityEvents.AddRange(World.AbilitySystem.Events);
+        _pendingAbilityPositions.AddRange(World.AbilitySystem.EventPositions);
+        World.AbilitySystem.ClearEvents();
 
         if (tick % SimConstants.TicksPerSnapshot == 0)
         {
             BroadcastSnapshot(tick);
             BroadcastCombatEvents();
+            BroadcastAbilityEvents();
         }
 
         if (tick % TicksPerStats == 0)
@@ -137,6 +144,7 @@ public sealed class GameServer : IDisposable
             {
                 Ore = World.EconomySystem.OreOf(session.PlayerId),
                 Queues = World.EconomySystem.QueuesOf(session.PlayerId),
+                Cooldowns = World.AbilitySystem.CooldownsOf(session.PlayerId),
             }.Write(_writer);
             peer.Send(_writer.Buffer, 0, _writer.Length, DeliveryMethod.Unreliable);
         }
@@ -308,6 +316,57 @@ public sealed class GameServer : IDisposable
         _pendingEventPositions.Clear();
     }
 
+    /// <summary>
+    /// 능력 연출 이벤트. 팀마다 시전자나 지점이 그 팀 시야 안인 것만 보내고,
+    /// 안 보이는 시전자·대상 ID 는 0 으로 가린다 (지점만 보여도 예고 범위·폭발은 보인다).
+    /// </summary>
+    private void BroadcastAbilityEvents()
+    {
+        if (_pendingAbilityEvents.Count == 0 || _sessions.Count == 0)
+        {
+            _pendingAbilityEvents.Clear();
+            _pendingAbilityPositions.Clear();
+            return;
+        }
+
+        _net.GetConnectedPeers(_peers);
+        foreach (var peer in _peers)
+        {
+            if (!_sessions.TryGetValue(peer.Id, out var session))
+            {
+                continue;
+            }
+
+            var team = World.TeamOf(session.PlayerId);
+            _visibleAbilityEvents.Clear();
+            for (var i = 0; i < _pendingAbilityEvents.Count; i++)
+            {
+                var (casterPos, point) = _pendingAbilityPositions[i];
+                var seeCaster = World.CanSee(team, casterPos);
+                var seePoint = World.CanSee(team, point);
+                if (!seeCaster && !seePoint)
+                {
+                    continue;
+                }
+
+                var e = _pendingAbilityEvents[i];
+                if (!seeCaster) e.Caster = 0;
+                if (e.Target != 0 && (World.Find(e.Target) is not { } t || !World.CanSee(team, t)) && !seePoint) e.Target = 0;
+                _visibleAbilityEvents.Add(e);
+            }
+
+            for (var start = 0; start < _visibleAbilityEvents.Count; start += AbilityEventsMessage.MaxPerPacket)
+            {
+                _writer.Reset();
+                AbilityEventsMessage.Write(_writer, _visibleAbilityEvents, start, Math.Min(AbilityEventsMessage.MaxPerPacket, _visibleAbilityEvents.Count - start));
+                peer.Send(_writer.Buffer, 0, _writer.Length, DeliveryMethod.Unreliable);
+            }
+        }
+
+        _pendingAbilityEvents.Clear();
+        _pendingAbilityPositions.Clear();
+    }
+
     private void BroadcastStats()
     {
         if (_sessions.Count == 0)
@@ -394,11 +453,11 @@ public sealed class GameServer : IDisposable
             {
                 case MessageType.UnitCommand:
                     var command = UnitCommand.Read(ref r);
-                    World.Command(session.PlayerId, command);
-                    if (command.ClientTick != 0 && command.ClientTick <= CurrentTick + SimConstants.TickRate)
+                    var delaySeconds = CommandDelay(command.ClientTick);
+                    World.Command(session.PlayerId, command, delaySeconds);
+                    if (command.ClientTick != 0)
                     {
-                        // 클라이언트가 추정한 서버 틱과 실제 받은 틱의 차이 = 대략 편도 지연 (최근 값 쪽으로 이동 평균)
-                        var delayMs = ((long)CurrentTick - command.ClientTick) * SimConstants.TickDelta * 1000f;
+                        var delayMs = delaySeconds * 1000f;
                         _commandDelayMs = _commandDelayMs == 0 ? delayMs : _commandDelayMs * 0.7f + delayMs * 0.3f;
                     }
 
@@ -484,6 +543,22 @@ public sealed class GameServer : IDisposable
         peer.Send(_writer.Buffer, 0, _writer.Length, DeliveryMethod.ReliableOrdered);
         _log($"peer {peer.Id} joined as player {playerId} (team {World.TeamOf(playerId)}) with {units.Count} units");
 
+    }
+
+    /// <summary>
+    /// 명령 지연(초) = 받은 서버 틱 − 명령의 ClientTick. ClientTick 은 클라이언트가 그 순간 추정한 서버 시각인데,
+    /// 그 추정은 마지막으로 받은 스냅샷 기준이라 내려오는 지연만큼 늦다. 그래서 이 값은 편도보다 크고 왕복에 가깝다
+    /// (= "플레이어가 본 화면 시각부터 서버가 받을 때까지"). 미래 틱이거나 비어 있으면 0, 1초를 넘으면 1초로 자른다.
+    /// 쓰는 쪽(선딜 보상)이 따로 상한을 둔다.
+    /// </summary>
+    private float CommandDelay(uint clientTick)
+    {
+        if (clientTick == 0 || clientTick > CurrentTick)
+        {
+            return 0f;
+        }
+
+        return MathF.Min(1f, (CurrentTick - clientTick) * SimConstants.TickDelta);
     }
 
     private bool TryAllocatePlayerId(out byte playerId)
