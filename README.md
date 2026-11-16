@@ -3,6 +3,8 @@
 .NET 서버와 Unity 클라이언트로 만드는 오픈소스 RTS 프로젝트입니다.
 서버 구조는 LeagueSandbox GameServer(LoL 4.20 서버 에뮬레이터)를 분석한 내용을 참고하지만, **코드는 가져오지 않고 새로 작성합니다** (아래 [라이선스 검토](#2-참고-자료-라이선스-검토) 참고).
 
+개발에 참여한다면 [개발 문서(docs/)](docs/README.md)부터 읽으세요: 개발 환경·코드 규칙, 아키텍처와 틱 순서, 프로토콜 형식, 시뮬레이션 규칙, 클라이언트 구성, 테스트 방법.
+
 ---
 
 ## 1. 저장소 구성
@@ -20,7 +22,8 @@ OpenRTS/
 │  └─ Assets/Scripts/              클라이언트 코드 (OpenRTS.Client.asmdef → OpenRTS.Shared 참조)
 ├─ Directory.Build.props           모든 .NET 빌드 출력을 artifacts/ 로 모음
 ├─ global.json                     .NET SDK 11.0.100 고정 (상위 기능 밴드 허용)
-└─ THIRD_PARTY_NOTICES.md          외부 라이브러리 라이선스 고지 (LiteNetLib MIT 등)
+├─ THIRD_PARTY_NOTICES.md          외부 라이브러리 라이선스 고지 (LiteNetLib MIT 등)
+└─ docs/                           개발 문서 (아키텍처·프로토콜·시뮬레이션·클라이언트·테스트·개발 규칙)
 ```
 
 ### 공용 코드(Shared) 관리 방식
