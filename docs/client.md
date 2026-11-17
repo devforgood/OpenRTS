@@ -37,7 +37,7 @@ Unity 6000.6.0f1, Built-in 렌더 파이프라인, 옛 Input Manager(`activeInpu
   | SimSettings | `Settings`, `SettingsChanged` 이벤트 |
   | SimStats | `Stats` |
   | CombatEvents | 대기 목록 → 렌더 시각이 되면 `DueCombatEvents` 로 |
-  | AbilityEvents | 같은 방식으로 `DueAbilityEvents` |
+  | AbilityEvents | 같은 방식으로 `DueAbilityEvents`. 단 내 유닛의 발사·예고는 받은 즉시 (`-delayed-own-events` 로 끔, abilities.md 9.4) |
   | PlayerState | `Ore`, `Queues`, `Cooldowns`(그 사이 로컬로 줄임) |
 
 - 명령: `SendCommand(type, unitIds, target, targetUnit[, kind])`, 능력은 `SendCast(unitIds, ability, point, targetUnit)`. 지금 추정한 서버 틱(`ServerClock / TickDelta`)을 `ClientTick` 으로 싣고, 255개씩 나눠 보냅니다.

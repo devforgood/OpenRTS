@@ -656,6 +656,7 @@ public sealed class World
         Combat.Reset();
         EconomySystem.Reset();
         AbilitySystem.Reset();
+        Ai.Reset();
 
         if (Settings.Scenario == BotScenario.Skirmish)
         {

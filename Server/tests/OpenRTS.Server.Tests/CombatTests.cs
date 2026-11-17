@@ -229,6 +229,30 @@ public class CombatTests
         Assert.False(theirs.IsMoving);
     }
 
+    /// <summary>
+    /// 안개 속에 숨은 생존자(진영 구석에 가만히 있는 플레이어 영웅 하나)가 있어도 상대 봇이 정찰로 찾아내 전투가 끝난다.
+    /// </summary>
+    [Theory]
+    [InlineData(MapKind.Open, 1)]
+    [InlineData(MapKind.Open, 2)]
+    [InlineData(MapKind.Blocks, 3)]
+    public void Battle_HiddenSurvivor_IsFoundByScouting(MapKind map, int seed)
+    {
+        var s = SimSettings.Default;
+        s.BotCount = 60;
+        s.Scenario = BotScenario.Battle;
+        s.Map = map;
+        s.PlayerUnits = 1;
+        var world = new World(seed, s);
+        world.AddPlayer(1); // 1팀 영웅 하나, x = -38 쪽 무작위 y
+        world.ResetScenario();
+        var hero = world.UnitsOf(1).Single();
+        hero.Position = new Vector2(-46, 44); // 구석에 숨긴다
+
+        var time = RunUntil(world, () => world.Winner != 0, 150f);
+        Assert.True(time < 150f);
+    }
+
     [Theory]
     [InlineData(MapKind.Open, 60)]
     [InlineData(MapKind.Open, 200)]

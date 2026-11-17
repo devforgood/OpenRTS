@@ -186,7 +186,8 @@ namespace OpenRTS.Client.View
 
             // 코 색: 공격 선딜 노랑, 능력 시전(선딜·정신 집중·돌진) 보라.
             // 내가 방금 시전한 유닛은 서버 확인 전에도 보라 (CastPrediction — 지연을 감추는 즉시 표시).
-            var casting = (state.Flags & UnitFlags.Casting) != 0 || (Prediction != null && Prediction.IsPredicting(state.Id));
+            var casting = ((state.Flags & UnitFlags.Casting) != 0 && !Client.RecentlyReleased(state.Id))
+                          || (Prediction != null && Prediction.IsPredicting(state.Id));
             var nose = casting ? 2 : (state.Flags & UnitFlags.WindingUp) != 0 ? 1 : 0;
             if (view.NoseState != nose)
             {

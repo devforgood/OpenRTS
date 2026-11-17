@@ -100,6 +100,30 @@ namespace OpenRTS.Client.Net
         /// <summary>능력 이벤트가 렌더 시각이 되어 재생될 때.</summary>
         public event Action<AbilityEvent> AbilityEventDue;
 
+        /// <summary>
+        /// 내 유닛이 시전한 능력의 발사(ProjectileLaunch)·범위 예고(AreaTelegraph)를 받은 즉시 재생할지 (기본 켬).
+        /// 다른 유닛과 얽힌 이벤트(적중·폭발·투사체 끝)는 그대로 렌더 시각에 재생한다.
+        /// 시전자는 선딜 동안 서 있으므로 화면 위치와 서버 위치가 거의 같아 어긋나지 않는다.
+        /// 명령줄 <c>-delayed-own-events</c> 로 끈다 (비교용).
+        /// </summary>
+        public bool ImmediateOwnEvents = true;
+
+        public int ImmediateAbilityEvents { get; private set; }
+
+        private readonly Dictionary<int, float> _ownReleasedAt = new Dictionary<int, float>();
+
+        /// <summary>
+        /// 내 유닛의 발사·예고를 방금 바로 재생했는지 (보간 지연 + 0.1초 안). 이 동안 스냅샷의 "시전 중" 플래그는
+        /// 과거(선딜 중) 상태라 무시해야 투사체가 나간 뒤에도 시전 자세가 남지 않는다.
+        /// </summary>
+        public bool RecentlyReleased(int unitId) =>
+            _ownReleasedAt.TryGetValue(unitId, out var t) && Time.realtimeSinceStartup - t < Interpolator.InterpolationDelay + 0.1f;
+
+        /// <summary>이 이벤트를 받은 즉시 재생하는지 (<see cref="ImmediateOwnEvents"/>).</summary>
+        public bool PlaysImmediately(in AbilityEvent e) =>
+            ImmediateOwnEvents && e.Caster != 0 && IsMine(e.Caster) &&
+            (e.Type == AbilityEventType.ProjectileLaunch || e.Type == AbilityEventType.AreaTelegraph);
+
         /// <summary>왕복 지연 추정 (실제 + 흉내, 초).</summary>
         public float RoundTripSeconds => (NetworkRttMs + SimulatedRttMs) / 1000f;
 
@@ -469,11 +493,22 @@ namespace OpenRTS.Client.Net
                     case MessageType.AbilityEvents:
                         AbilityEventsMessage.Read(ref r, _abilityBuffer);
                         AbilityEventsReceived += _abilityBuffer.Count;
-                        _pendingAbilityEvents.AddRange(_abilityBuffer);
                         foreach (var e in _abilityBuffer)
                         {
+                            if (PlaysImmediately(e))
+                            {
+                                DueAbilityEvents.Add(e); // 내 시전의 발사·예고는 보간 지연 없이 바로
+                                ImmediateAbilityEvents++;
+                                _ownReleasedAt[e.Caster] = Time.realtimeSinceStartup;
+                            }
+                            else
+                            {
+                                _pendingAbilityEvents.Add(e);
+                            }
+
                             AbilityEventReceived?.Invoke(e);
                         }
+
                         break;
 
                     case MessageType.CombatEvents:
@@ -499,7 +534,6 @@ namespace OpenRTS.Client.Net
         }
 
         private void ReadCommandLine()
-
         {
             var args = Environment.GetCommandLineArgs();
             for (var i = 0; i < args.Length - 1; i++)
@@ -510,6 +544,14 @@ namespace OpenRTS.Client.Net
                     case "-port": Port = int.Parse(args[i + 1]); break;
                     case "-latency": SimulatedRttMs = int.Parse(args[i + 1]); break;
                     case "-loss": SimulatedLossPercent = int.Parse(args[i + 1]); break;
+                }
+            }
+
+            foreach (var arg in args)
+            {
+                switch (arg)
+                {
+                    case "-delayed-own-events": ImmediateOwnEvents = false; break;
                 }
             }
         }

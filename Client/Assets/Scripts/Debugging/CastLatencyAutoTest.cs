@@ -34,6 +34,7 @@ namespace OpenRTS.Client.Debugging
         public UnitViewManager Views;
         public RtsInput Input;
         public CastPrediction Prediction;
+        public AbilityEffects Effects;
 
         private enum Phase
         {
@@ -76,6 +77,16 @@ namespace OpenRTS.Client.Debugging
         private void Start()
         {
             Client.AbilityEventDue += OnDue;
+            Effects.ProjectileShown += OnProjectileShown;
+        }
+
+        /// <summary>③ 발사: 투사체를 실제로 그리기 시작한 순간 (내 시전은 받은 즉시, 아니면 렌더 시각).</summary>
+        private void OnProjectileShown(int caster, AbilityId ability)
+        {
+            if (caster == _hero && ability == AbilityId.ShockBolt && _phase == Phase.Waiting && _launch < 0)
+            {
+                _launch = Time.realtimeSinceStartup - _sent;
+            }
         }
 
         private void OnDue(AbilityEvent e)
@@ -89,7 +100,6 @@ namespace OpenRTS.Client.Debugging
             if (_phase == Phase.Waiting)
             {
                 if (e.Type == AbilityEventType.CastStart && _confirm < 0) _confirm = t;
-                if (e.Type == AbilityEventType.ProjectileLaunch && _launch < 0) _launch = t;
             }
             else if (_phase == Phase.Reject && e.Type == AbilityEventType.CastStart)
             {
@@ -236,7 +246,8 @@ namespace OpenRTS.Client.Debugging
             var rejectOk = _rejectCleared >= 0 && _rejectCleared <= limit && !_serverStartedDuringReject;
             var ok = poseOk && rejectOk && Prediction.ActiveCount == 0;
             Finish(ok,
-                $"lag compensation {(_compensation ? "on" : "off")}, rtt {Client.NetworkRttMs}+{Client.SimulatedRttMs} ms, interp delay {Client.Interpolator.InterpolationDelay * 1000:0} ms: " +
+                $"lag compensation {(_compensation ? "on" : "off")}, own events {(Client.ImmediateOwnEvents ? "immediate" : "delayed")}, " +
+                $"rtt {Client.NetworkRttMs}+{Client.SimulatedRttMs} ms, interp delay {Client.Interpolator.InterpolationDelay * 1000:0} ms: " +
                 $"pose avg {Avg(r => r.Pose)} ms (max {_results.Max(r => r.Pose) * 1000:0}), " +
                 $"server confirm avg {Avg(r => r.Confirm)} ms, projectile visible avg {Avg(r => r.Launch)} ms " +
                 $"[{string.Join(" / ", _results.Select(r => $"{r.Launch * 1000:0}"))}], event-lost rounds {_lostRounds}; " +

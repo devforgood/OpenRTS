@@ -36,7 +36,23 @@ namespace OpenRTS.Client.View
             public float Remaining;
             public float Speed;
             public float Age;
+
+            /// <summary>화면상 벽·적에 닿아 멈춘 채 서버의 "투사체 끝"을 기다리는 중.</summary>
+            public bool Held;
+            public float HeldAge;
+            public int PierceLeft;
+            public float Width;
+            public HashSet<int> Passed;
         }
+
+        /// <summary>멈춘 투사체가 서버의 끝 이벤트를 기다리는 최대 시간(초). 이벤트가 유실돼도 사라지게.</summary>
+        private const float MaxHoldSeconds = 0.6f;
+
+        private OpenRTS.Shared.Map.MapKind? _wallsFor;
+        private IReadOnlyList<OpenRTS.Shared.Map.WallRect> _walls = new OpenRTS.Shared.Map.WallRect[0];
+
+        /// <summary>투사체를 처음 그리기 시작할 때 (시전자, 능력). 지연 측정용.</summary>
+        public event System.Action<int, AbilityId> ProjectileShown;
 
         private struct Disc
         {
@@ -100,7 +116,11 @@ namespace OpenRTS.Client.View
                             Direction = length > 1e-4f ? to / length : Vector2.UnitX,
                             Remaining = def.Homing ? float.MaxValue : length,
                             Speed = def.ProjectileSpeed,
+                            PierceLeft = def.Pierce,
+                            Width = def.ProjectileWidth,
+                            Passed = new HashSet<int>(),
                         });
+                        ProjectileShown?.Invoke(e.Caster, e.Ability);
                     }
 
                     break;
@@ -120,7 +140,9 @@ namespace OpenRTS.Client.View
                     break;
 
                 case AbilityEventType.AreaTelegraph:
-                    AddDisc(e.Point, def.AreaRadius, new Color(0.45f, 0.08f, 0.06f), def.AreaDelay, shrink: false);
+                    // 바로 재생한 내 예고는 폭발(렌더 시각에 재생)까지 남도록 보간 지연만큼 더 둔다
+                    var life = def.AreaDelay + (Client.PlaysImmediately(e) ? Client.Interpolator.InterpolationDelay : 0f);
+                    AddDisc(e.Point, def.AreaRadius, new Color(0.45f, 0.08f, 0.06f), life, shrink: false);
                     break;
 
                 case AbilityEventType.AreaHit:
@@ -145,6 +167,20 @@ namespace OpenRTS.Client.View
             {
                 var f = _flights[i];
                 f.Age += dt;
+                if (f.Held)
+                {
+                    f.HeldAge += dt;
+                    if (f.HeldAge > MaxHoldSeconds || f.Age > MaxFlightSeconds)
+                    {
+                        Destroy(f.Ball.gameObject);
+                        _flights.RemoveAt(i);
+                        continue;
+                    }
+
+                    _flights[i] = f;
+                    continue;
+                }
+
                 var step = f.Speed * dt;
                 if (f.Target != 0 && Views.InterpolatedPositions.TryGetValue(f.Target, out var target))
                 {
@@ -161,6 +197,16 @@ namespace OpenRTS.Client.View
                 }
 
                 var move = Mathf.Min(step, f.Remaining);
+                if (f.Target == 0 && StopsOnScreen(ref f, move, out var stopAt))
+                {
+                    // 화면에 보이는 벽·적에서 멈추고 서버의 끝 이벤트를 기다린다 (바로 재생한 내 투사체가 앞질러 지나가지 않게)
+                    f.Position = stopAt;
+                    f.Held = true;
+                    f.Ball.position = UnitViewManager.ToWorld(f.Position, height);
+                    _flights[i] = f;
+                    continue;
+                }
+
                 f.Position += f.Direction * move;
                 f.Remaining -= move;
                 if (f.Remaining <= 0 || f.Age > MaxFlightSeconds)
@@ -174,6 +220,79 @@ namespace OpenRTS.Client.View
                 _flights[i] = f;
             }
         }
+
+        /// <summary>
+        /// 이번 이동 구간에서 화면상 맵 벽이나 (관통 수를 넘는) 적에 닿는지. 서버 판정을 흉내 낸 연출용이며 판정은 서버가 한다.
+        /// </summary>
+        private bool StopsOnScreen(ref Flight f, float move, out Vector2 stopAt)
+        {
+            stopAt = f.Position;
+            var start = f.Position;
+            var end = start + f.Direction * move;
+
+            var map = Client.Settings?.Map ?? OpenRTS.Shared.Map.MapKind.Open;
+            if (_wallsFor != map)
+            {
+                _walls = OpenRTS.Shared.Map.MapLayouts.Create(map);
+                _wallsFor = map;
+            }
+
+            var wallT = 1f;
+            foreach (var wall in _walls)
+            {
+                if (wall.SegmentEntry(start, end, out var t) && t < wallT)
+                {
+                    wallT = t;
+                }
+            }
+
+            var reach = f.Width / 2 + Views.Radius;
+            var bestAlong = float.MaxValue;
+            var bestId = -1;
+            foreach (var kv in Views.InterpolatedPositions)
+            {
+                if (kv.Key == f.Caster || f.Passed.Contains(kv.Key) || !IsEnemyOf(f.Caster, kv.Key))
+                {
+                    continue;
+                }
+
+                var along = Vector2.Dot(kv.Value - start, f.Direction);
+                if (along < 0 || along > move * wallT)
+                {
+                    continue;
+                }
+
+                var closest = start + f.Direction * along;
+                if (Vector2.Distance(closest, kv.Value) <= reach && along < bestAlong)
+                {
+                    bestAlong = along;
+                    bestId = kv.Key;
+                }
+            }
+
+            if (bestId >= 0)
+            {
+                f.Passed.Add(bestId);
+                if (f.PierceLeft-- <= 0)
+                {
+                    stopAt = start + f.Direction * bestAlong;
+                    return true;
+                }
+            }
+
+            if (wallT < 1f)
+            {
+                stopAt = start + (end - start) * wallT;
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>시전자와 그 유닛이 적인지 (둘 다 화면에 있는 유닛의 팀으로).</summary>
+        private bool IsEnemyOf(int caster, int other) =>
+            Client.Latest.TryGetValue(caster, out var c) && Client.Latest.TryGetValue(other, out var o) &&
+            OpenRTS.Shared.Combat.UnitArchetypes.AreEnemies(c.Team, o.Team);
 
         private void UpdateDiscs(float dt)
         {

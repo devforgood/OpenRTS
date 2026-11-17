@@ -199,6 +199,11 @@ namespace OpenRTS.Client.Controls
                 return;
             }
 
+            ConfirmFor(e);
+        }
+
+        private void ConfirmFor(AbilityEvent e)
+        {
             foreach (var p in _active)
             {
                 if (p.Unit == e.Caster && p.Ability == e.Ability)
@@ -224,6 +229,13 @@ namespace OpenRTS.Client.Controls
 
         private void OnReceived(AbilityEvent e)
         {
+            // 내 발사·예고를 바로 재생하는 경우: 시전은 이미 끝났으므로 렌더 시각의 CastStart 를 기다리지 않고 확인으로 친다
+            if (Client.PlaysImmediately(e))
+            {
+                ConfirmFor(e);
+                return;
+            }
+
             if (e.Type != AbilityEventType.CastCancel)
             {
                 return;

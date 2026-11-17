@@ -111,6 +111,7 @@ namespace OpenRTS.Client
                 test.Views = views;
                 test.Input = input;
                 test.Prediction = prediction;
+                test.Effects = abilityEffects;
             }
 
             if (BattleAutoTest.IsRequested())
